@@ -1,0 +1,252 @@
+// Core 0's side of a write: a burst of captured WDATA intervals in, sectors
+// out, into the live track (so the host reads them back at once) and the
+// disk (so they last). Pure C++, host-tested.
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+
+#include "amiga_track.h"
+#include "cylinder_loader.h"
+#include "drive.h"
+#include "mfm_decode.h"
+#include "track_source.h"
+#include "track_write.h"
+
+// One burst: what the host wrote while WGATE was asserted.
+struct WriteBurst {
+    uint8_t cylinder;
+    uint8_t head;
+    uint32_t start_byte;      // where on the track WGATE was asserted, in bytes from the index
+    const uint8_t* intervals; // as wdata_pio captured them: ticks, less the edge ticks
+    size_t count;
+    uint8_t drive = 0;        // which of the emulator's drives (bus.h) it was written to
+};
+
+struct BurstResult {
+    track_write::Result decoded;
+    unsigned patched = 0;    // sectors put into the live track
+    unsigned persisted = 0;  // sectors written to the disk
+    unsigned failed = 0;     // sectors the disk refused (a card error, or the card gone)
+    bool overrun = false;    // the capture outran core 0: nothing written
+};
+
+// A write the drive couldn't keep: the disk refused a sector, or the
+// capture overran and the burst was dropped. A floppy has no way to tell
+// the host, which carries on as if it worked. So the drive then reports
+// write-protect until the disk is inserted again: the host's next write
+// fails visibly ("Write protect error") instead of being lost as well.
+inline bool lostWrite(const BurstResult& r) { return r.overrun || r.failed > 0; }
+
+// Core 1's side of a write: when to start and stop capturing WDATA. A
+// capture runs from WGATE asserted to WGATE released (or the drive
+// deselected), and only while the drive is selected, has a disk and isn't
+// write-protected. Pure C++, so the firmware and the tests share it.
+class WriteGate {
+public:
+    enum class Action : uint8_t { None, Start, Stop, Missed };
+
+    // Call on every sample. `buffer_free`: core 0 has finished with the last
+    // burst. On Start, `burst` gets the cylinder, head and track position;
+    // the caller starts the capture. On Stop, the caller stops it and hands
+    // the burst over. Missed: WGATE came while the buffer was busy (the
+    // burst is lost; counted once per assertion).
+    Action onSample(uint32_t now_us, uint32_t pins, drive::Drive& d, bool buffer_free, uint32_t data_rate_bps,
+                    WriteBurst& burst);
+
+    bool capturing() const { return capturing_; }
+
+private:
+    bool capturing_ = false;
+    bool missed_ = false;
+};
+
+class BurstWriter {
+public:
+    // `store` holds decoded data fields: a full track's worth (9216 bytes for
+    // 1.44 MB) plus room for stray fields. For a flux image it holds the
+    // burst's cells, so up to a track's (ibm::MAX_TRACK_WORDS words, 2-byte
+    // aligned) is kept; a longer burst's end is lost.
+    BurstWriter(TrackSource& source, CylinderLoader& loader, uint8_t* store, size_t store_len, mfm::Field* fields,
+                size_t max_fields)
+        : source_(source),
+          loader_(loader),
+          scanner_(store, store_len, fields, max_fields),
+          amiga_(store, store_len),
+          store_len_(store_len),
+          store_(store) {}
+
+    // Each sector goes to the disk first, and into the live track only once
+    // the disk has it: if the disk refuses it, the host reads back the old
+    // data, so a host that verifies its writes sees the failure.
+
+    // A whole burst at once.
+    BurstResult apply(const WriteBurst& burst, uint32_t ticks_per_cell, uint32_t edge_ticks);
+
+    // The same in pieces, as the capture arrives: begin() with the burst's
+    // cylinder, head and position (its intervals and count are ignored),
+    // feed() the intervals in any number of chunks, then finish().
+    void begin(const WriteBurst& burst, uint32_t ticks_per_cell, uint32_t edge_ticks);
+    void feed(const uint8_t* intervals, size_t count);
+    BurstResult finish();
+
+    // Called between the sectors finish() writes to the disk, when set: a
+    // track's worth takes the card 60 ms or more, longer than the audio
+    // queue lasts, so the firmware services the audio here.
+    void (*between_writes)() = nullptr;
+
+private:
+    // An Amiga's track write: each sector names its track and number.
+    track_write::Result interpretAmiga(const ibm::Format& fmt, int cylinder, uint8_t head, track_write::Update* out,
+                                       size_t max) const;
+
+    TrackSource& source_;
+    CylinderLoader& loader_;
+    mfm::FieldScanner scanner_;  // IBM fields
+    amiga::SectorScanner amiga_;  // or AmigaDOS sectors, for an Amiga disk; the store is shared
+    bool amiga_disk_ = false;
+    // A flux image's write: the cells themselves, spliced into the track.
+    // An interval's cells (n - 1 zeros, then a 1) onto the burst's words.
+    ALWAYS_INLINE void rawInterval(unsigned n) {
+        raw_word_ = raw_word_ << n | 1u;
+        raw_bits_ += n;
+        if (raw_bits_ < 16) return;
+        raw_bits_ -= 16;
+        uint16_t* words = reinterpret_cast<uint16_t*>(store_);
+        if (raw_words_ < store_len_ / 2) words[raw_words_] = uint16_t(raw_word_ >> raw_bits_);
+        ++raw_words_;
+    }
+    BurstResult finishRaw(const ibm::Format& fmt);
+    bool raw_disk_ = false;
+    size_t store_len_ = 0;
+    uint32_t raw_words_ = 0;
+    unsigned raw_bits_ = 0;
+    uint32_t raw_word_ = 0;  // the last cells; the low raw_bits_ not yet stored
+    uint8_t* store_;
+    mfm::DataSeparator separator_{16};
+    WriteBurst burst_{};
+    uint32_t edge_ticks_ = 0;
+};
+
+// Core 0's side of a streaming capture. The WDATA intervals arrive in a ring
+// (the DMA writes round it endlessly; the PIO program runs only while WGATE
+// is asserted), and core 1 marks where each burst starts and ends. This
+// feeds each burst to a BurstWriter as its bytes arrive, a chunk per call,
+// so no burst ever has to fit in memory at once and core 0 can do other
+// work (audio) between chunks. Pure C++, host-tested.
+//
+// Positions are free-running byte counts: the ring index is the count
+// modulo the ring size. If core 0 falls a whole ring behind, the bytes it
+// hasn't read are gone: that burst is abandoned and counted, never decoded
+// from overwritten data. It gives up a little early (the guard: a quarter
+// ring, at most 4 KB): the DMA keeps writing while a chunk is read, and must
+// not lap the bytes being read. 4 KB is 11 ms of writing at 1.44 MB, far
+// longer than reading a chunk takes.
+class CaptureStream {
+public:
+    // A mark from core 1: a burst began (with its cylinder, head and track
+    // position) or ended, at byte `at` of the stream.
+    struct Mark {
+        bool start;
+        uint32_t at;
+        WriteBurst burst;  // start only
+    };
+
+    CaptureStream(const uint8_t* ring, uint32_t ring_bytes, BurstWriter& writer)
+        : ring_(ring), mask_(ring_bytes - 1), guard_(ring_bytes / 4 < 4096 ? ring_bytes / 4 : 4096), writers_{&writer, &writer}, writer_(&writer) {}
+
+    // The writer for drive `drive`'s bursts (WriteBurst::drive); the one
+    // given to the constructor takes the rest.
+    void setWriter(uint8_t drive, BurstWriter& writer) {
+        if (drive < bus::MAX_DRIVES) writers_[drive] = &writer;
+    }
+
+    // Feeds up to `max_bytes` more of the current burst, up to `produced`
+    // (how far the DMA has written). Takes marks from `next_mark` as it
+    // reaches them; returns true and fills `done` when a burst finishes.
+    // `next_mark(Mark&)` returns false when there are no more marks yet.
+    template <typename NextMark>
+    bool service(uint32_t produced, size_t max_bytes, NextMark next_mark, BurstResult& done);
+
+    bool inBurst() const { return in_burst_; }
+    // The drive the current (or last) burst was written to.
+    uint8_t burstDrive() const { return burst_drive_; }
+    uint32_t overruns() const { return overruns_; }
+    // How far into the stream core 0 has read: the bytes fed, for timing.
+    uint32_t consumed() const { return consumed_; }
+
+private:
+    const uint8_t* ring_;
+    uint32_t mask_;
+    uint32_t guard_;
+    BurstWriter* writers_[bus::MAX_DRIVES];
+    BurstWriter* writer_;  // the current burst's
+    uint8_t burst_drive_ = 0;
+    uint32_t consumed_ = 0;
+    bool in_burst_ = false;
+    bool have_end_ = false;
+    bool lost_ = false;  // this burst overran: skip to its end
+    uint32_t end_ = 0;
+    uint32_t overruns_ = 0;
+    Mark pending_{};
+    bool have_pending_ = false;
+
+public:
+    uint32_t ticks_per_cell = 16;
+    uint32_t edge_ticks = 2;
+};
+
+template <typename NextMark>
+bool CaptureStream::service(uint32_t produced, size_t max_bytes, NextMark next_mark, BurstResult& done) {
+    for (;;) {
+        if (!have_pending_) have_pending_ = next_mark(pending_);
+        if (!in_burst_) {
+            if (!have_pending_) return false;
+            if (pending_.start) {
+                burst_drive_ = pending_.burst.drive < bus::MAX_DRIVES ? pending_.burst.drive : 0;
+                writer_ = writers_[burst_drive_];
+                writer_->begin(pending_.burst, ticks_per_cell, edge_ticks);
+                consumed_ = pending_.at;
+                in_burst_ = true;
+                have_end_ = false;
+                lost_ = false;
+            }
+            have_pending_ = false;  // a stray end mark is dropped
+            continue;
+        }
+        if (!have_end_ && have_pending_ && !pending_.start) {
+            end_ = pending_.at;
+            have_end_ = true;
+            have_pending_ = false;
+        }
+        uint32_t limit = have_end_ ? end_ : produced;
+        if (produced - consumed_ > mask_ + 1 - guard_) lost_ = true;  // overwritten, or about to be
+        if (!lost_) {
+            uint32_t n = limit - consumed_;
+            if (n > max_bytes) n = uint32_t(max_bytes);
+            while (n) {
+                uint32_t at = consumed_ & mask_;
+                uint32_t run = mask_ + 1 - at < n ? mask_ + 1 - at : n;  // up to the ring's end
+                writer_->feed(ring_ + at, run);
+                consumed_ += run;
+                n -= run;
+                max_bytes -= run;
+            }
+        }
+        if (have_end_ && (lost_ || consumed_ == end_)) {
+            in_burst_ = false;
+            if (lost_) {
+                // Abandoned: never finish() it, so nothing it decoded is
+                // written. The next begin() resets the writer.
+                ++overruns_;
+                consumed_ = end_;
+                done = BurstResult{};
+                done.overrun = true;
+                return true;
+            }
+            done = writer_->finish();
+            return true;
+        }
+        return false;  // waiting for more bytes, or out of budget for this call
+    }
+}

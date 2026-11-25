@@ -1,0 +1,119 @@
+"""Slice 0: listen only. Drive the Greaseweazle and check what the drive saw.
+
+Nothing answers yet: there is no TRK00 and no index, so the Greaseweazle's
+seeks and RPM checks fail. The point is the trace of what it tried.
+
+Exit criterion: clean, repeatable traces of a seek and an RPM check, saved
+in host/reference/ (run with --save-reference).
+"""
+from __future__ import annotations
+
+import shutil
+
+import pytest
+
+from conftest import require_build
+from fddproto import trace
+from fddproto.paths import REFERENCE
+
+pytestmark = pytest.mark.slice0
+
+QUIET_S = 0.5   # the action is over once the trace is quiet this long
+TRACE_TIMEOUT_S = 30
+
+
+@pytest.fixture(autouse=True)
+def listen_build(firmware_slice):
+    require_build(firmware_slice, drive_build=False)
+
+
+@pytest.fixture
+def capture(drive, gw, run_dir, request):
+    """Runs one Greaseweazle action and returns (its result, the drive's trace)."""
+
+    def run(name: str, action):
+        mark = drive.mark()
+        result = action()
+        drive.wait_quiet(QUIET_S, timeout=TRACE_TIMEOUT_S)
+        lines = drive.lines_since(mark)
+        stats = drive.command("s", "STATS")
+
+        t = trace.parse(lines)
+        (run_dir / f"{name}.txt").write_text("\n".join(lines) + "\n")
+        report = (f"$ {' '.join(result.command)}\n(exit {result.returncode})\n{result.output}\n"
+                  f"{trace.summary(t)}\n{stats}\n")
+        (run_dir / f"{name}_summary.txt").write_text(report)
+        print(report)
+        if request.config.getoption("--save-reference"):
+            REFERENCE.mkdir(exist_ok=True)
+            shutil.copy(run_dir / f"{name}.txt", REFERENCE / f"slice0_{name}.txt")
+            shutil.copy(run_dir / f"{name}_summary.txt", REFERENCE / f"slice0_{name}_summary.txt")
+        return result, t
+
+    return run
+
+
+def test_idle_lines(drive, gw):
+    """With the Greaseweazle reset, no request line is asserted: no select,
+    motor, step or write gate. DENSEL, DIR, SIDE1 and WDATA are levels, which
+    a host may leave either way: the Feather leaves DIR where its last seek
+    put it, and holds WDATA low from its first command on (a drive ignores
+    WDATA without WGATE)."""
+    pins = drive.command("p", "PINS")
+    requests = ("DRVSA", "DRVSB", "MOTEA", "MOTEB", "STEP", "WGATE")
+    asserted = [item for item in pins.split()[1:] if item.endswith("=ON") and item.split("=")[0] in requests]
+    assert not asserted, f"lines asserted while idle (wiring?): {asserted} in {pins}"
+
+
+def test_seek_trace(capture, gw):
+    """A seek: the Greaseweazle selects the drive and steps out, looking for
+    track 0. Without TRK00 it gives up after its own step limit."""
+    _, t = capture("seek", lambda: gw.seek(2))
+    assert not t.empty, "no activity on the cable during gw seek"
+    assert not t.dropped, "the trace lost events"
+    assert {"DRVSA", "DRVSB"} & t.held_signals(), "no drive select during the seek"
+    assert any(s.direction == "OUT" for s in t.steps), "no steps outwards (towards track 0)"
+    if "Adafruit" in gw.info().output:
+        # Adafruit_Floppy's search for track 0, with no TRK00: 100 steps out,
+        # then 20 in (VirtualAdafruitFloppy). The STEP glitch at the start of
+        # each command adds one more step out. No inward steps means DIR
+        # isn't reaching the drive.
+        moves = [(s.direction, s.count) for s in t.steps if s.count > 1]
+        assert ("IN", 20) in moves, f"no 20 steps inwards after the search (DIR wiring?): {moves}"
+    state = t.final_state()
+    assert not state.get("DRVSA") and not state.get("DRVSB"), "a drive is still selected afterwards"
+
+
+def test_rpm_trace(capture, gw):
+    """An RPM check turns the motor on and waits for index pulses, which
+    don't come yet."""
+    r, t = capture("rpm", gw.rpm)
+    assert not t.dropped, "the trace lost events"
+    assert {"MOTEA", "MOTEB"} & t.held_signals(), "no motor enable during gw rpm"
+    state = t.final_state()
+    if r.ok:
+        assert not state.get("MOTEA") and not state.get("MOTEB"), "a motor is still on afterwards"
+    else:
+        # With no index pulses, gw 1.23 dies dividing by zero before it turns
+        # the motor off; the gw fixture's reset does it instead.
+        print(f"gw rpm failed (exit {r.returncode}); motor left {'on' if state.get('MOTEB') or state.get('MOTEA') else 'off'}")
+
+
+def test_drive_letters(capture, gw):
+    """Which select and motor pins `--drive A` and `--drive B` use, so the
+    firmware answers on the right ones. A host with one drive select (the
+    Feather + FeatherWing) refuses the other letter: "Command Failed: Select",
+    though gw still exits 0, after the glitches every command starts with."""
+    seen, refused = {}, []
+    for letter in "AB":
+        r, t = capture(f"drive_{letter}", lambda: gw.seek(0, motor_on=True, drive=letter))
+        pins = t.held_signals() & {"DRVSA", "DRVSB", "MOTEA", "MOTEB"}
+        if "Command Failed: Select" in r.output or (not r.ok and not pins):
+            refused.append(letter)
+        else:
+            seen[letter] = pins
+    print(f"drive letters: {seen}, refused: {refused}")
+    assert seen, "no drive letter asserted any select or motor pin"
+    assert all(seen.values()), f"a drive letter asserted nothing: {seen}"
+    if len(seen) == 2:
+        assert seen["A"] != seen["B"], f"A and B used the same pins: {seen}"

@@ -1,0 +1,510 @@
+# Changelog
+
+All notable changes to this firmware. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and versions follow [SemVer](https://semver.org/).
+
+## [Unreleased]
+
+## [0.25.0-dev.4] - 2026-11-18
+
+### Fixed
+- **SynthMinder couldn't find the Duo with its drive empty, on the Evesham:** the BIOS steps to cylinder 1 and back to clear DISK CHANGE before it seeks, and with the line still on (no disk to clear it) reports the drive not ready, so the head never reached the mailbox. With the mailbox on, a step now clears the line with the drive empty too; the drive still has no index anywhere but at cylinder 82, so DOS still finds no disk there, and a disk going in sets the line again (`insertDisk`), so DOS sees it.
+
+### Tested
+- **On the Evesham (18 Nov 2026), with a disk in A:,** SynthMinder found the Duo through cylinder 82 and listed the images on its card: the first exchanges on a real PC and BIOS.
+
+## [0.25.0-dev.3] - 2026-11-18
+
+### Added
+- **`<Eject disk>` first in the front panel's disk list:** press on it to take the disk out, as a long action does, so the drive can be left empty from the list. With the drive empty the list opens on it (`>` marks it), and any image goes in, the one that came out too (`ui::Model::EJECT`).
+
+## [0.25.0-dev.2] - 2026-11-18
+
+### Added
+- **The mailbox works with no disk in.** At cylinder 82 an empty drive spins, streams the mailbox's track and takes SynthMinder's writes as if a disk were in, and doesn't report the disk change there (`Drive::mailboxStandIn`, `mediaPresent`). On every other cylinder it's empty as before, so DOS never sees a disk arrive. It doesn't do this while a swap fills the cache: core 1 turns it off then (`setMailboxWhenEmpty`). So SynthMinder can still talk to the Duo after ejecting the disk in the drive it talks through.
+- **The trip back from the mailbox is silent:** a run of steps that starts at cylinder 82 makes no sound (`activity::Config::quiet_cylinder`), so SynthMinder's exchanges cost one seek's sound, the trip out, which can't be told from any other seek until it ends.
+
+## [0.25.0-dev.1] - 2026-11-18
+
+### Added
+- **SynthMinder can talk to the drive** (the DOS program that sets up the IDE Synth Bay and the HDD Synth; [docs/synthminder.md](../docs/synthminder.md)). The floppy cable carries no commands, so the two exchange sectors at **cylinder 82**, past the end of an 80-track disk: SynthMinder writes a request to sector 1 through the BIOS (INT 13h), and reads the reply from sectors 5-9 of the same track. `MailboxSource` (`src/mailbox.*`) sits between each drive's disk and its loader and writer, serves that cylinder itself and never passes it to the image. The requests are `$FDQ`/`$FDC` sentences in the HDD Synth's format (`src/sentence.h`), answered by `src/duo_commands.*`: the drive's status, the images on the card (in pages), the sample packs, the settings; a disk into A: or B:, an eject, the pack, the volume, and a setting into FDDSYNTH.CFG for the next power-on. A swap of the drive the request came through waits until the head leaves cylinder 82 (or 1.5 s), so the PC can read the reply first; a pack and the settings file wait until the drive is idle, as the front panel's do.
+- From power-on the reply sectors hold `$FDK,1,HELLO,OK,` (sequence 0), so SynthMinder finds the drive by reading alone and never writes to a real drive.
+- With the head at cylinder 82, a PC drive never reports write-protect (`drive::Config::mailbox_cylinder`), so SynthMinder can write its request whatever disk is in; the disk itself stays protected.
+- Console `s` shows `mailbox0=on:<answered>/<repeats>/<stray>` (and `mailbox1`): `off` for a disk that has no mailbox.
+- `test_mailbox.cpp`: the sentences, the sector format, the answers against a pretend drive, and a virtual PC exchanging requests at cylinder 82 through the BIOS's reads and writes. With the board's write costs, the reply is there on the first revolution, at 500 and 250 kbit/s.
+
+### Changed
+- The virtual PC's controller checks write-protect when a write starts, after the seek, as a uPD765 does (it checked before seeking).
+
+### Limits
+- The mailbox needs a PC disk in the drive, or none: IBM MFM, 80 tracks or fewer, single-stepped, with at least 9 sectors of 512 bytes (720 KB, 1.2 MB, 1.44 MB, DMF). Flux images, Amiga disks, FM and 40-track disks have none.
+- Not yet tried on a PC.
+
+## [0.24.2] - 2026-11-10
+
+### Changed
+- **The welcome disk is FDD Synth Duo's:** its volume is `FDDSYNTHDUO` (it was `FDDSYNTHPRO`), README.TXT's banner says DUO, and the boot sector's message and the sample FDDSYNTH.CFG name FDD Synth Duo.
+- **The console's `READY` line says `READY FDDSynthDuo`.** Nothing reads the name: the host tools only look for `READY `. The USB device is still called FDDSynthPro, which is how `DriveLog` finds the board's port.
+- The virtual PC's test disk, the showreel's captions and the panel page say FDD Synth Duo.
+
+## [0.24.1] - 2026-11-10
+
+### Changed
+- **The project is now FDD Synth Duo** (it was FDD Synth Pro): the OLED shows the new logo at power-on (`media/FDDSynthDuo.png`). `scripts/make_splash.py` now crops the logo to its dark ink, so the new logo's grey shadow and the faint bars beside DUO don't shrink it and break DUO's bars up. The console's `READY` line, the welcome disk and the file names still say FDDSynthPro.
+
+## [0.24.0] - 2026-11-06
+
+### Fixed
+- **An Amiga couldn't use the drive:** an A1200 selects its drive for a few microseconds at a time (32 selects of about 4 us to read the drive ID from /RDY, and about 20 us around each step, with DIR set and cleared alongside the select), and core 1's once-a-pass sample couldn't keep up. Kickstart read a garbled ID and never booted from DF0; with that patched it never saw track 0 (the head knocking at the stop) and lost steps (a seek to cylinder 40 ended on 32 or 35), so the disk read as NDOS. The Amiga's bus now runs at hardware speed in PIO (`amiga_pio`): two edge samplers give the inputs as they were at the instant STEP or the select fell (`Drive::onStepEdge`, `onSelectEdge`: whether a step was this drive's and which way, and the motor line at select), and a gate puts the outputs on the cable only while the select is asserted, within a few cycles (`Drive::outputsSelected`). A step takes DIR as STEP rises again (`fdd_step`), as a drive does: a loader may set DIR in the same write that pulls STEP low. One drive only (`drive=df0` or `df1`); two still run on core 1 alone. On the A1200 (Kickstart 3.0): Workbench reads the disk, and Robocod and Turrican boot from it.
+
+### Added
+- **The logo at power-on:** the OLED shows the FDD Synth Pro logo (`media/FDDSynthPro.png`, made into a bitmap by `scripts/make_splash.py`) for a second, then the home screen; a turn or press skips it. It's drawn as the panel starts, so it shows while the card is mounted and the disk cached, and the drive doesn't wait for it.
+- **Console `j`, then a name and Enter:** swaps straight to that image (`j robocod`, or `ROBOCOD.ADF`, any case), one eject and insert instead of a `]` for every image on the way. `l` lists the card's images, the one in marked.
+- `test_amiga_short_selects_*` drive the model the way the A1200 does, sampled as the board samples it, and reproduce the faults with core 1 alone; `test_amiga_pio_sim.py` runs `fdd_edge`, `fdd_gate` and `fdd_gate_od` in the simulator.
+
+## [0.23.10] - 2026-11-06
+
+### Fixed
+- **DOS FORMAT formatted every track twice:** on the Evesham, the first verify of 148 tracks in 160 failed, and FORMAT reset the controller and formatted the track again. A write is shown by re-encoding the head and copying it over the buffer the DMA is streaming. The copy overtook the head in the middle of the sector the verify was reading, which then read half old and half new: a CRC error. An ordinary write changes one sector, rarely the one being read, so it hardly showed; a format changes all of them. The copy now starts at the word the DMA fetches next (`rdata_pio::nextWord`), so it stays ahead of the head all the way round, and the one run of changed words the head is in is held back until the head has left it (`CylinderLoader`'s `StreamPosition`). That sector reads whole, old, as it would on a real drive the instant before the write.
+
+### Added
+- The virtual PC formats tracks (INT 13h function 5: a revolution's write from the index), and a bad data CRC now fails its read as a 765 does, instead of the PC reading the sector again next revolution: `test_pc_format_verifies_first_time` formats and verifies tracks with the board's write timings.
+
+## [0.23.9] - 2026-11-06
+
+### Fixed
+- **The drive spun and clicked by itself with the computer off:** a switched-off PC holds every line on the cable low through its chips' protection diodes, which reads as both selects, both motors, the write gate and a step all asserted, so the drive on USB played its spin. All the inputs low at once is something no running host does, so the drive now takes it as the host switched off (`fdd::hostOff`) and the lines as released: no select, no motor, no steps, no write gate, and the trace shows them released. The console says `# host off` and `# host on`, and `s` shows `host=off`.
+
+## [0.23.8] - 2026-11-06
+
+### Fixed
+- **A real PC's steps could be missed:** core 1 saw a step only when one of its passes sampled STEP low, and a PC's controller pulses STEP for a few microseconds. A pulse that fell inside a long pass (the one restarting the stream at the index, just where a sequential read steps to the next cylinder) was lost: the head stayed a cylinder short and the PC got "Sector not found" (the Evesham, copying `RANDOM.BIN`, at cylinder 9; every retry's seek back came up one step short too). Steps are now counted from the GPIO block's edge latch (its raw interrupt status, which latches whether or not the interrupt is enabled), so every falling edge on STEP is a step, exactly once, however short. The Greaseweazle's 15 µs and the Feather's 13 ms pulses were always long enough.
+
+## [0.23.7] - 2026-11-06
+
+### Added
+- **Console keys for the front panel:** `,` is the action button, `.` an encoder press, `<` and `>` a turn down and up. Each goes to the panel's model as the controls' inputs do, and prints the screen it leads to (`# panel Stats volume=50`), so a script can step through the screens and set the volume the way the encoder does.
+
+## [0.23.6] - 2026-11-05
+
+### Fixed
+- **A card pause could lose a PC's write:** the card now and then holds a write or sync for 50-60 ms (seen in the soak). While a PC writes a track's sectors one after another, the 16 KB capture ring (33 ms of slack) overran, the write was lost and write-protect went on. The ring is now 32 KB, the DMA's largest ring wrap, and the stream's guard is capped at 4 KB, so core 0 can fall 77 ms behind. The Feather never showed it: it writes a whole track as one burst, and the pause falls in the gap after it.
+
+### Added
+- The virtual PC can time the write path (`Core0Costs::decode_kbps`, `finish_us`, `card_stall_us`): `test_pc_card_stalls` writes tracks of sectors while the card stalls, and checks that a sector never reads back wrong, that a lost write sets write-protect, and that stalls up to 60 ms lose nothing.
+
+## [0.23.5] - 2026-11-05
+
+### Changed
+- **The audio queue is twice as long: 16 blocks, 93 ms** (`cfg::AUDIO_BUFFERS`). In the soak the card now and then held a single write or sync for 50-60 ms, which can't be split, and the 46 ms queue ran dry. It costs 4 KB of RAM, and a sound may come up to 93 ms after its event.
+
+## [0.23.4] - 2026-11-05
+
+### Fixed
+- A swap to an HFE image still dropped the sound out (a 55 ms gap): the swap's last step loads the cylinder under the head, both heads in one go, about 27 ms each for HFE, with no turn for the audio. It now services the audio between the loader's steps.
+
+## [0.23.3] - 2026-11-05
+
+### Fixed
+- Loading an HFE cylinder (both heads, about 50 ms of card reads) gave the audio no turn, longer than its 46 ms queue: a swap to an HFE image could drop the sound out. `hfe::Disk::between_reads` services the audio between its 16-block reads (`sd_image::setBetweenReads`).
+
+## [0.23.2] - 2026-11-05
+
+### Fixed
+- **A volume or pack set with console `e` could be lost:** the drive saves what's in use (the panel's volume, the loaded pack), so the old value went back into the file when a second setting followed before a restart. `e` now applies the volume, and loads the pack, at once.
+
+## [0.23.1] - 2026-11-05
+
+### Changed
+- **The Recorded pack is about 9 dB louder:** one gain for the whole pack was set by the bump, 12 dB over every other click, which left the rest about 15 dB under the placeholder pack (inaudible at low volumes). `make_recorded_pack.py` now gives the clicks and motor one gain (a step 6 dB under full scale) and scales the bump on its own; it's still the loudest sound. The showreel is re-rendered with it.
+- **An HD HFE image loads in 3.9 s, not 5.8:** the cache fills a cylinder at a time (`TrackSource::readCylinder`), and an HFE file, whose blocks hold both heads' halves, is read once for the two instead of once each; its cells are staged and copied into PSRAM 64 bytes at a time.
+
+### Added
+- Console `s`: `audio_gap_us_max`, the longest wait between two services of the audio queue (46 ms long); `z` zeroes it. The soak's log records it with `audio_underruns`.
+
+### Fixed
+- HFE writes no longer hold up the audio: the track goes to the card in 4 KB pieces, with the audio serviced between them (a whole track took 84 ms, against a 46 ms audio queue).
+
+## [0.23.0] - 2026-11-05
+
+The panel and amplifier on the rig, an HFE write fix, and other formats proved against the Feather.
+
+### Fixed
+- **The drive could be dead from power-on, with an IMG.CFG on the card:** core 0's start-up (mounting the card, `img_cfg::find` parsing a section for each image) used 4.3 KB of its 4 KB stack, and in the Pico SDK's layout core 1's 2 KB stack sits just below. The overrun overwrote where `setup1()` returns to, so core 1 never reached `loop1()`: no disk, no steps, no sound, though the console answered. Core 1 now has its own 8 KB stack (`core1_separate_stack`), leaving core 0 both scratch banks, and `find` keeps its kilobyte-plus parse state off the stack (3.3 KB at start-up now).
+- **The sound dropped out on every track write:** finishing a burst held core 0 for 65 ms, longer than the 46 ms audio queue, because each sector re-encoded the whole head into the live track (18 encodes a track). The sectors now go into the track data first and the head is encoded once (`CylinderLoader::storeSector`, `encodeHead`): 12 ms a track. `BurstWriter::between_writes` lets the firmware service the audio between the card writes too.
+- **HFE writes failed the host's verify:** each track write rewrote the file a byte at a time and held core 0 for 816 ms. `hfe::Disk::writeTrackBytes` now reads, patches and writes 16 blocks at a time: 84 ms. A test holds it to a byte-by-byte model.
+
+### Added
+- Console `s`: `core1` (how far core 1 has got: 5 is running), `core0_stack` (core 0's deepest stack use, from a pattern painted at power-on) and `finish_us_mean` (a burst's mean end, card included; `z` zeroes it).
+- Rig tests:
+  - `-m formats` (`test_formats.py`): 160 KB, 360 KB, 800 KB, 1.2 MB, DMF 1.68 MB and an FM Acorn DFS disk from an IMG.CFG section, each read back whole with Greaseweazle's own definition.
+  - `-m soak` (`test_soak.py`, `FDDPRO_SOAK_HOURS`): random reads, writes (each undone and checked), whole-disk reads, swaps and restarts until the time runs out, stopping at the first mismatch or fault.
+  - slice 5's writes also run on an HFE image.
+
+### Measured and left out
+- Writing a burst's sectors to the card as one multi-sector write was slower on the test card (92 ms a track against 82), so sectors are still written one by one with a single sync.
+
+## [0.22.0] - 2026-11-05
+
+### Added
+- **Settings without taking the card out:** console `e`, then `key=value` and Enter, writes one setting to `/FDDSYNTH.CFG` (when the drive is idle) and prints the file; `!` restarts the drive with it, as HDDSynthPro's `E` and `!`. Unknown keys and bad values are refused (`settings::set`, sharing `parse`'s line handling). The rig's `DriveLog` has `set_setting` and `restart`, and the Amiga rig test sets the drive up and back by itself.
+
+### Changed
+- The Amiga rig test (`-m amiga`) reaches the ADF in Shugart mode (`interface=shugart`, `drive=ds1`), not as DF1: an Amiga drive latches its motor line as it's selected, and the Feather selects first and starts the motor 6 ms later, so as DF1 the motor never ran (as it wouldn't on a real Amiga drive). An ADF is served as AmigaDOS tracks whatever the interface; the virtual Amiga covers the latch.
+
+### Fixed
+- **An image could start with 4 wrong bytes after a restart:** `pmalloc` writes its bookkeeping next to the image cache through the XIP cache, and a cache line holding that and the image's first bytes was written back after the image went in, putting back what PSRAM held before. Seen on the rig as an ADF's first long reading `00000011` after the drive had served a DOS disk; reproduced, and gone with the fix. The image now starts clear of the allocator's cache lines, with room after it, and the cache is cleaned (`xip_cache_clean_all`) before the image is copied in.
+- The solder-bridge test's arming could miss a `Y` sent in the same millisecond as the `x` (its time was stored as `millis() | 1`, a millisecond ahead).
+
+## [0.21.0] - 2026-11-05
+
+First run on a BB48R (PSRAM and microSD) on the carrier, against the Feather host: the solder-bridge test and slices 0 to 5 pass, image swaps go round all six test images, and an HFE image reads back byte for byte.
+
+### Fixed
+- **Writes kept up with the capture only on the Mac:** on the board the decoder managed 200 KB/s against an HD write's 370, so every HD write overran and was abandoned (a write fault). It now runs at 1,700 KB/s: `BurstWriter::feed` is in RAM with the data separator and field scanner inlined, the scanner takes a whole flux interval at a time (`FieldScanner::addInterval`; an MFM sync ends in a 1, so one check an interval finds every one), and a word decodes without a loop. Amiga writes take whole intervals too (`amiga::SectorScanner::addInterval`), as do HFE writes; FM still goes cell by cell (its marks can end in a 0).
+- **A whole-track write held core 0 for 74 ms:** each sector was synced to the card on its own. Sectors are now synced once a burst (`TrackSource::flush`), still before the live track shows them; a failed sync is a lost write.
+- **An HD HFE image took 24 s to load** (and the drive seemed hung while it did): each cell was stored with a read-modify-write of uncached PSRAM, and the file was read a half-block at a time. Whole bytes are stored at once and 16 blocks read at a time: 5.8 s.
+- During a write, core 0 prints at most 4 trace lines a pass, so a flood of them (noise on undriven select lines while WDATA toggles, seen on the Feather rig) can't take the time the decoder needs.
+
+### Added
+- `host/tests/test_amiga_rig.py` (`-m amiga`): the Amiga mode on the rig, with the Feather as DF1's host (`interface=amiga`, `drive=df1`): the index, a whole ADF read back, and whole-track writes.
+- Console `s`: `decode_kbps`, `decode_bytes`, `finish_us_max` (the slowest end of a burst, writing to the card included) and `burst_gap_us_max` (the longest gap between core 0's passes during a write); `z` zeroes them.
+
+## [0.20.0] - 2026-11-05
+
+### Changed
+- **Settings name each drive's disk as HDDSynthPro does:** `device0` and `device1` in `/FDDSYNTH.CFG` are the disks to start with (were `image` and `image2`), and `last0` and `last1` the disks that were in (were `last` and `last2`). Drives count from 0, as HDDSynthPro's devices and Shugart's DS0 do: device 0 is the first drive `drive` names. The old names still work, and the drive writes them under the new names when it next saves; if a file has both, the new name counts. The welcome disk's sample `FDDSYNTH.CFG` and README use the new names.
+
+## [0.19.0] - 2026-11-04
+
+First run on the carrier board (with a plain BB48: no PSRAM or card), against the Feather host: slices 0 and 1 pass, and slice 2 reads the generated disk byte for byte.
+
+### Changed
+- **Encoding a track is 5 times faster** (26 ms to 3.0 ms an HD head, measured on the board), so a cylinder is ready within the host's 15 ms settle time. Lookup tables for the MFM encoder, the CRC and the cell interleave, kept in RAM; the encoder's and interleave's loops run from RAM (`src/ram_func.h`), out of the flash cache that core 1 runs from; and a field's bytes are encoded, stored and added to its CRC in one pass.
+- **The motor is heard only once its line has held for 1 ms** (`DriveObserver::MOTOR_HOLD_US`). The Feather host pulses the motor line for up to 34 us at the start of every command, which played a blip of spin-up.
+
+### Added
+- Console `t`: times a loader step on the board, in its parts (`BENCH ... read_us build_us interleave_us`, min/mean/max). Console `z` zeroes the loader's timings; `s` shows their means and counts as well as the maxima.
+
+## [0.18.0] - 2026-10-29
+
+### Added
+- **HFE flux images** (`.hfe`, v1 and v3; `src/hfe.*`): each track's cells as recorded, so copy-protected disks keep their bad CRCs, duplicate sector IDs, long tracks and weak bits, and disks the drive has no encoder for still work. Matched cell for cell against Greaseweazle's own HFE files (PC, Amiga and FM disks, and synthetic protection tracks); a DOS session on an HFE, written to and decoded back by Greaseweazle, is judged by mtools and fsck.fat.
+- **Weak bits** go out as random flux, renewed several times a revolution.
+- **Writes to an HFE** (v1) are spliced into the track's cells and written back to the file at once.
+- The panel shows `HFE` in place of a size; the console reports tracks whose bit rate changes along them (served at one rate).
+
+### Changed
+- **PSRAM per drive:** 4.5 MB with one drive (an HD flux image), 3 MB each with two.
+- **A second drive's RAM buffers** (77 KB) are allocated at power-on only when one is set up: the one-drive build is down to 49% of RAM statically.
+- Track buffers hold a track 5% longer than an HD revolution (13,125 words), for long-track protections.
+
+## [0.17.0] - 2026-10-29
+
+### Added
+- **FM (single density)** in `IMG.CFG` (`mode = fm`): the recording of 1970s and early-1980s disks, as on the Osborne 1, 8-inch CP/M systems, the BBC Micro's DFS and the Spectrum's Sandy FDD2. Whole disks of it, or an FM boot track on an MFM disk. Tracks match Greaseweazle's `ibm.fm` cell for cell (the Osborne 1, TSC Flex and CompuPro's 8-inch disks from FlashFloppy's examples), and writes are decoded and placed as MFM's are.
+- **Tracks at half a disk's rate:** an FM boot track at 125 kbit/s on a 250 kbit/s MFM disk goes out with each cell doubled, since the streamer runs at one rate per disk.
+- **A track up to 5% too long** for a revolution (CompuPro's 8-inch FM boot track) lengthens the revolution to fit, as Greaseweazle and a GoTek do.
+
+## [0.16.1] - 2026-10-29
+
+### Added
+- **A sample settings file on the welcome disk:** `FDDSYNTH.CFG` ([welcome/FDDSYNTH.CFG](welcome/FDDSYNTH.CFG)), with a note on each setting, to copy to the card. `scripts/embed_welcome.py` now puts every file in `welcome/` on the disk, README.TXT first.
+
+### Fixed
+- **A settings file with notes in it was read only as far as 512 bytes**, so settings after a long comment were lost. The drive now reads up to 4 KB.
+
+## [0.16.0] - 2026-10-29
+
+### Added
+- **A disk to start with every time:** `image=` (and `image2=`) in `/FDDSYNTH.CFG`, set by hand, is the disk the drive starts with at every power-on, whatever was chosen on the panel since. The drive never changes it. If it isn't on the card, the console says so and the drive goes on to `last`.
+
+### Changed
+- **The remembered disk is now `last=`** (and `last2=`): the drive keeps it up to date as disks are chosen, and starts with it when `image` isn't set. A file written by earlier firmware has the remembered disk under `image=`, which now fixes it; delete that line to go back to remembering.
+- The welcome disk's README says what the Shugart interface is for.
+
+## [0.15.0] - 2026-10-29
+
+### Added
+- **The welcome disk,** as HDDSynthPro has: with no SD card, or no image on it, the drive serves a 1.44 MB DOS floppy (volume FDDSYNTHPRO) holding `README.TXT`, which explains how to set the drive up. Its text is [welcome/README.TXT](welcome/README.TXT) in the repo, embedded at build time by `scripts/embed_welcome.py`. Every sector is computed, so it costs no RAM; writes stay in PSRAM until a restart. A PC that boots it is told it isn't a system disk. Checked by mtools and fsck.fat, and read and written by the virtual PC.
+- Console `g` swaps the generated test disk in, and back. Slice 2's rig test uses it, so it no longer needs the card taken out.
+
+### Changed
+- Without a card, the drive serves the welcome disk instead of the generated one. `i` prints `IMAGE welcome 1440` (or `IMAGE generated 1440`).
+
+## [0.14.0] - 2026-10-29
+
+### Added
+- **The Amiga:** `interface=amiga` with `drive=df0` (pin 10), `df1` (pin 12) or both. The motor line is latched as the drive is selected, and pin 34 is /RDY, giving a standard drive's ID while the motor is off.
+- **ADF images** (`.adf`, 880 KB): AmigaDOS tracks (`src/amiga_track.*`), matched cell for cell against Greaseweazle's `amiga.amigados`. The Amiga's whole-track writes, from anywhere round the track, are decoded (`amiga::SectorScanner`) and written back to the image. A virtual Amiga reads and writes tracks through the whole drive in the tests.
+- **Pin 2 as an output** (`pin02=chg`, GPIO 23): DISK CHANGE for Shugart and Amiga hosts, through the SN7407's spare gate after a rework of the rev B carrier ([docs/wiring.md](../docs/wiring.md)). Never driven with `interface=ibmpc`. The solder-bridge test now drives GPIO 23 too.
+
+## [0.13.0] - 2026-10-29
+
+### Added
+- **Disk formats beyond 720 KB and 1.44 MB.** `ibm::Format` now describes any IBM-style MFM disk: cylinders (up to 255), one or two heads, double stepping, the image's file layout, 300 or 360 RPM, the data rate, and per-track layouts (sector count and size, first sector ID, head ID, interleave, skew, gaps, index mark). Gaps and rates left on auto are chosen by Greaseweazle's rules.
+- **PC images by size:** 160, 180, 320 and 360 KB (40 cylinders), 720 and 800 KB, 1.2 MB (360 RPM), 1.44 MB and 1.68 MB (DMF), each matched cell for cell against Greaseweazle's `ibm.*` definitions. 2.88 MB isn't: its 1 Mbit/s track is twice what the streamer holds.
+- **GoTek's IMG.CFG** (`src/img_cfg.*`): FlashFloppy's community geometry file, read from `/IMG.CFG` or `/FF/IMG.CFG`, matched by tag and size as FlashFloppy does. Images it describes (`.img`, `.ima`, `.dsk`) are listed and served. Tested on sections from FlashFloppy's own examples (Roland, Kaypro, GRiD, Bung, Ensoniq), whose tracks match Greaseweazle's cell for cell. A section that needs FM recording, mixed sector sizes on a track, `img_bps` or per-track rates is reported on the console, and the image goes by its size instead.
+- The virtual PC runs DOS on 1.2 MB and 360 KB disks.
+
+### Changed
+- The image cache holds up to 2 MB a drive (Ensoniq's 1.6 MB, Bung's 1.76 MB); a bigger image's tracks are read from the card.
+- Core 1 no longer reads core 0's format objects: core 0 publishes each disk's rate, track length, revolution and last cylinder, and core 1 sets the drive's speed and inner stop from them at each insert.
+- The panel names any size: 360K, 1.2M, 1.44M, 1.6M.
+
+## [0.12.0] - 2026-10-29
+
+### Added
+- **Two drives:** `drive=a,b` (or two Shugart units) in `/FDDSYNTH.CFG` makes the emulator A: and B: on one cable, each with its own disk (`image`, `image2`), head, motor, image cache in PSRAM and cylinder buffer. Core 1 runs a drive model for each and puts their outputs on the cable together; the RDATA streamer follows the selected drive, starting at the word under its head (`rdata_pio::switchTo`), and the capture runs at its rate. Write bursts carry their drive, and each drive's writer takes its own (`CaptureStream::setWriter`).
+- The panel has a home screen per drive (`A: GAMES.IMG`); the disk list and the long press act on the drive last shown. The console's `1` and `2` choose which drive `i`, `[`, `]` and `d` act on; `s` adds the second drive's fields with a `2` suffix.
+- The virtual PC changes drives as the BIOS does (`useDrive`), and `dos_session --copy` copies every file from A: to B:, checked by mtools and fsck.fat (`test_copy_from_a_to_b`).
+
+### Changed
+- An image the other drive has open opens read-only.
+- The sound events treat two drives as one mechanism: the motor runs while either's does.
+
+## [0.11.0] - 2026-10-29
+
+### Added
+- **Drive select, as a real drive's jumpers:** `interface`, `cable` and `drive` in `/FDDSYNTH.CFG` (`src/bus.*`, [docs/config.md](../docs/config.md)). An IBM PC drive is A or B, past a twist or on a straight cable, and answers on 12/16 or 14/10 to match. A Shugart drive answers on DS0, DS1 or DS2 (pins 10, 12, 14) with MOTOR ON on pin 16, and puts READY on pin 34 instead of DISK CHANGE. The default is unchanged: a PC drive past the twist, on 12/16. `s` reports the setup in use.
+
+## [0.10.0] - 2026-10-26
+
+### Added
+- **The disk is served from PSRAM.** Each image is copied into the BB48R's 8 MB PSRAM before it goes in (`ImageCache`, `src/image_cache.*`): at power-on, about 0.6 s, and during a swap's ejected pause, a track per pass so the panel and sound carry on. Track reads become memory copies, so a cylinder is ready about 7 ms after the head stops (it was 11), and a panel frame can take 8 ms before the settle time is at risk (it was 4). Writes go to the card first, then the cache, so a refused write never shows as written. Without PSRAM it reads from the card as before. The cache is read through PSRAM's uncached alias, so the copies don't evict core 1's code from the XIP cache it shares.
+- **Builds for wiring the outputs straight to the header** while the SN7407 is on order: `bb48_direct` and `bb48_drive_direct`. The five outputs work as open drain (the host's pull-ups take them to 5 V); RDATA uses the same PIO program with its side-set driving the pin's direction. FeatherWing host only, never a real PC. The READY line ends in `direct`, and `docs/wiring.html` has a **Without the SN7407** switch.
+- `s` reports `cached`, `card_read_us_max` and `fill_ms`.
+
+### Changed
+- **The SD card runs at 25 MHz**, the spec's default speed, instead of 37.5 MHz: the cache takes the card off the seek path.
+
+### Fixed
+- Restarting RDATA at each index pulse could send one stray flux pulse: the jump that restarts the program carried side-set 0 (asserted). It now carries side-set 1.
+
+## [0.9.0] - 2026-10-26
+
+### Changed
+- **The pin map is now for the BB48R**, the BB48 with PSRAM and a microSD slot. The old map put MOTEB, DIR, STEP and WDATA on GPIO 8–11, which the R uses for its PSRAM select and SD slot. **Rewire before flashing:** inputs DENSEL–SIDE1 move to GPIO 12–21 (same order), the outputs to GPIO 4–7 (INDEX, TRK00, WPT, RDATA) and 22 (DSKCHG), and the encoder and action button to GPIO 32–35. The I2S amp and the OLED stay where they were. `docs/wiring.html` draws the new wiring.
+- **The SD card is read through the BB48R's own slot**, in SPI mode on SPI1 (GPIO 9, 10, 11, 24), instead of a 4-bit SDIO breakout on GPIO 32–37. It runs at 37.5 MHz: about 2 ms a track, inside the 3 ms the settle-time tests allow. 25 MHz would take 3.5 ms, and a panel frame starting as the head steps could then make a cylinder late.
+- The solder-bridge test drives only the fifteen floppy pins, never the board's PSRAM and SD pins, and watches GPIO 0–3 and 23 as neighbours.
+
+## [0.8.1] - 2026-10-23
+
+### Changed
+- **The panel never starts a frame while a cylinder is loading** (`CylinderLoader::loading()`), so drawing can't eat into the host's settle time mid-load.
+
+### Added
+- **The panel's cost on core 0 is now tested, not argued.** The virtual PC's machine draws a frame every 100 ms (2 ms each, pessimistic; drifting against the disk's rotation, as on the board) between loader steps. Through a session of random seeks and single steps every cylinder is ready within 14 ms of the last step (settle: 15 ms), the frame rate holds, and core 0's longest step is a fraction of the audio queue. The worst case, a frame starting just as the head steps, is built on purpose: frames up to 4 ms still make every settle time, so the board's `draw_us_max` must stay under that.
+
+## [0.8.0] - 2026-10-23
+
+### Added
+- **The drive remembers the disk, the sample pack and the volume across power-off**, GoTek style, in `/FDDSYNTH.CFG` on the card (`src/settings.*`): plain text, by name, so adding files doesn't change which disk comes back. A change is written 3 s after the last one, and only while the drive is idle. A missing or damaged file falls back to the defaults.
+- **Choosing the sample pack on the panel:** on the Sounds screen, press the encoder for the card's packs (every folder under `/samples`), turn and press to load one (console `k`: the next). It loads when the drive is idle (`LOADING WHEN IDLE` until then); the old pack's memory is freed first, and a running motor carries on in the new pack's sound.
+- **A sample pack from a real drive** (`samples/Recorded`, `scripts/make_recorded_pack.py`): spin-up, spin, spin-down, step, seek and bump, cut from a recording of a 3.5-inch drive driven by the FDD Synth's software. Each cut was found by measuring the recording (click onsets and spacing, the 199.8 ms revolution, spectra); the loops are whole revolutions and whole steps, joined smoothly. No insert or eject: the recording has none. 147 KB, inside the 160 KB pool. The showreel now uses it (`make_showreel.py --pack` picks another), and calls the project FDD Synth Pro.
+- **A showreel** (`scripts/make_showreel.py`, `test/tools/showreel.cpp`): a 36-second video of a virtual PC using a real FAT12 disk while the front panel is worked. A swap from the panel, boot and `DIR`, reads with the volume turned down, the head trace across a long seek, the sounds and stats screens, a save with the volume back up, motor off and an eject. The OLED frames and the audio come from the firmware's own screens and mixer, in simulated real time.
+
+### Fixed
+- The swap screen named the new disk while the old one was coming out ("EJECTING GAMES.IMG" when DOS622 was ejecting). It names the disk going out, then the one going in.
+- **A write could be decoded from bytes the DMA was overwriting.** The capture stream checked for an overrun once, then read; if core 0 was nearly a whole ring behind, the DMA could lap the bytes as they were read. It now gives up a quarter ring early, before reading any of it.
+- **A swap to an image that won't open left a closed file in the drive.** Opening the new image closes the old one, so a later insert served stale or blank tracks. The old image is now reopened and put back; if that fails too, the drive stays empty and refuses an insert until a swap works.
+- An eject or insert (console `d`, or holding the action button) during a swap could put the old disk back mid-swap, and a write then landed in the new image. It's now refused while a swap runs.
+- A disk chosen on the panel during a console swap was dropped. It now waits and swaps when the first one finishes.
+- Looking for the OLED could block core 0 for up to 50 ms after the drive had started; it now happens first.
+- The solder-bridge test names the encoder, button and amp pins.
+
+## [0.7.0] - 2026-10-23
+
+### Added
+- **The front panel works (drive build)**: an SSD1306 OLED on the BB48's Qwiic socket (I2C1, GPIO 2/3), a rotary encoder (GPIO 20-22) and an action button (GPIO 23), as on the HDD Synth (`src/panel.*`).
+  - Turn for the volume. Press for the disk list, turn to choose, press to insert. The action button steps through home, head trace, sounds and stats; holding it for a second ejects the disk or inserts it again.
+  - A frame goes to the I2C FIFO a few bytes per pass of core 0's loop, so it never holds up the loader or the audio.
+  - Console `s` adds `oled`, `frames`, `draw_us_max`, `oled_aborts` and `volume`.
+  - Host-tested: the controls as inputs (`controls.h`), the bus bytes (`ssd1306.h`), and the mixer's volume, which glides over 12 ms so it never clicks.
+- **A virtual PC driving the whole drive** (`test/native/virtual_pc.h`, `test_virtual_pc.cpp`). It models a BIOS and an 82077-style controller:
+  - 3 ms steps, a 15 ms settle and a 500 ms motor start;
+  - recalibrating by checking TRK00 before each step;
+  - finding sectors in the drive's own RDATA cells, and giving up after two index pulses;
+  - sector writes with the controller's gap 2 timing;
+  - three tries with recalibration, and the disk-change check.
+
+  It runs against a `Machine` (`test/native/machine.h`): the drive model, loader, write path and sound events, with core 0 loading in the background at SDIO speed. A DOS-like session passes first time throughout, with no retries:
+  - boot from cylinder 30;
+  - read the boot sector, FAT and root directory;
+  - read a file across the disk;
+  - write a track and the FAT, and read them back from the card;
+  - a disk swap.
+
+  Further tests cover a head switch with no settle, a write-protected disk, a 720 KB disk, and a card too slow to ever answer, where the read fails rather than returning stale data. The session's sound events are saved to `.pio/native-tests/pc_session_act.txt`.
+
+- **Swapping images, GoTek style (drive build).** The drive lists every 720 KB and 1.44 MB image on the card in name order. Console `]` and `[` swap to the next or previous image:
+  1. the disk is ejected, setting DSKCHG;
+  2. half a second later the new image is opened and the cylinder under the head loaded;
+  3. both PIO programs are retuned if the data rate changed;
+  4. the disk is inserted.
+
+  `i` shows `index=2/3`. A button can drive the same swap later.
+- `DiskSlot` (the disk in the drive, which the loader and write path go through), `ImageList`, `CylinderLoader::reset`, `rdata_pio::setFormat` and `wdata_pio::setRate`.
+- **The virtual PC finds a disk's data rate** after a change, trying 500 and then 250 kbit/s as a BIOS does. Tests cover a swap from 1.44 MB to 720 KB and back, writes going to the disk that's in, and the image list's ordering and filtering. A rig test (`test_swaps.py`, `-m slice6`) swaps through every image on the card.
+
+- **The FDD Synth plays (drive build).**
+  - **The mixer** (`synth.h`, pure C++): sound events in, samples out, by the player's rules. It has 32 one-shot voices (the oldest is stolen past that), the spin loop and up to four seek loops, and saturates at 16 bits.
+  - **The pack:** at power-on, core 0 loads the first folder under `/samples` on the card into a 160 KB pool in RAM.
+  - **Output:** core 0 mixes into a MAX98357A over I2S (GPIO 26–28), topping up a 46 ms queue between its slower steps.
+  - **Events:** reach the mixer as soon as core 0 takes them; the `ACT` lines follow when the serial link can take them.
+  - **Console:** `s` adds `pack`, `audio_underruns` and `voices_stolen`.
+  - **Golden test:** the mixer matches the Python player sample for sample, on the virtual PC's session, motor and seek edge cases, and random event sequences (`test/tools/render_events`, `host/tests/test_synth.py`).
+  - `wav.h` is copied from HDDSynth_Native, so packs follow the same rules.
+- **The sample player** (`python -m fddproto.player <trace> <out.wav>`) mixes a trace's sound events with a sample pack, by the rules the synth's firmware will follow. It works on the virtual PC's session or a real drive's log.
+
+- **Streaming write capture.** WDATA goes into a 16 KB ring by endless DMA (RP2350), in place of an 80 KB buffer for a whole burst.
+  - Core 1 marks each burst's start and end; core 0's `CaptureStream` decodes behind it in 2 KB chunks, with audio served between them.
+  - Bursts queue rather than wait for a single buffer.
+  - If core 0 ever falls a whole ring behind, that burst is dropped and counted (`capture_overruns`), never decoded from overwritten data.
+  - `BurstWriter` takes a burst in pieces (`begin`, `feed`, `finish`).
+  - Tests: a sector write across the ring's wrap, back-to-back bursts, a whole track through 16 KB, and an overrun that writes nothing. The virtual PC's sessions run through the streaming path.
+- **The sample pool is one allocation sized to the pack** (up to 160 KB), loaded in two passes, instead of a fixed 160 KB array.
+- Static RAM in the drive build falls from 85% to 41%.
+
+- **The front panel, ready for an OLED, an encoder and an action button (screens and controls only; the drivers come with the hardware).**
+  - `ui.h`: the controls, as on the HDD Synth. Turn for volume, or to choose on the disk list; press for the disk list, or to insert the chosen disk; action for the next screen (home, head trace, sounds, stats); hold action to eject or insert.
+  - `screens.h`: the 128 × 64 screens. Home shows the image, a big track number, the head, the format, write-protect, the activity, a disk that spins with the motor, and a head marker across 80 cylinders. The others are the disk list, the disk change, volume, the head trace (the head's cylinder over the last few seconds, so seeks draw themselves), sounds and stats.
+  - The canvas, font, encoder decoder and button handling are copied from HDDSynth_Native, so the two synths share a look and a feel.
+  - Host tests cover the controls and render every screen. `docs/oled/` holds the PNGs. `scripts/build_panel_page.py` builds an interactive panel page from the firmware's own frames.
+  - The mixer gains no volume yet: the UI model holds it for when the panel is wired.
+
+- **A hardware pack.**
+  - `docs/parts.md` lists every part, with links to UK suppliers where they stock it, marking which you have and which are optional.
+  - `docs/wiring.html` is an interactive pin-to-pin diagram with a soldering checklist covering the floppy header, the SN7407, the pull-ups, the SD card, the amp and the planned front panel, plus a zone plan for the Perma-Proto board.
+  - The front panel's pins are planned and reserved in `config.h`: the OLED on the BB48's own Qwiic socket (GPIO 2/3), the encoder on GPIO 20–22 and the action button on 23. A test checks no GPIO is used twice.
+  - The input pull-ups are an 11-pin bussed SIP network: ten inputs need ten resistors, which the 10-pin network doesn't have.
+
+- **Lost writes are no longer silent.** Each sector goes to the card first, and into the live track only if the card took it, so a host that verifies sees the failure. After any lost write (a card error, the card pulled out, or a capture overrun), the drive reports write-protect until the disk is inserted again (`d`, or a swap), so the host's next write fails visibly. The console prints `# WRITE FAULT`; `s` adds `write_faults`.
+- **Tests:**
+  - random intervals and random fields behind real sync marks, which never write a sector;
+  - a property test that damaging any interval of a real write stores exactly the right sector or nothing (1,500 cases, never wrong data);
+  - a virtual PC writing to a failing card, which gets its old data back, then write-protect, then works again after a re-insert.
+
+- **A real DOS disk through the whole drive.**
+  - `mtools` builds a genuine FAT12 disk with a volume label, a fragmented file and a subdirectory.
+  - The virtual PC mounts it through the drive with a minimal DOS (`test/native/dos.h`): it reads the BIOS parameter block, FAT and root directory, reads every file by its cluster chain, and writes a new one (data, both FATs, the directory entry).
+  - `fsck.fat` then finds the disk consistent, and `mtools` reads every file, old and new.
+  - Covered: 1.44 MB, 720 KB (found by rate detection), and a 100 KB file across tracks and both heads (`host/tests/test_dos_disk.py`, `test/tools/dos_session`).
+  - CI installs `mtools` and `dosfstools`.
+
+### Fixed
+- The test suite failed on CI (GCC): two test files defined different `MemorySource` classes, an ODR violation. One is gone, and each test file's helpers now live in an anonymous namespace.
+
+### Changed
+- The player mixes in integers and saturates, as the firmware does, instead of normalising the whole render.
+- Core 1's RDATA gate and write-capture control moved out of `main.cpp` into pure code (`drive::Drive::streams`, `WriteGate` in `write_burst.h`), so the firmware and the virtual PC share them.
+- Faster CI and local test runs:
+  - the C++ tests build through `test/native.mk`, in parallel and only what changed;
+  - the firmware build and the tests run as separate jobs side by side, and the tests job fetches only `pioasm` rather than all of PlatformIO;
+  - the Greaseweazle comparison checks a spread of tracks by default, and all 160 on tags, on a manual run, or with `FDDPRO_FULL_TRACKS=1`.
+
+## [0.6.0] - 2026-10-23
+
+### Added
+- **Slice 5, writing (`bb48_drive` build, now `FIRMWARE_SLICE` 5).** The drive takes writes into an image on the SD card.
+  - **Capture:** `fdd_wdata.pio` times WDATA's flux transitions while WGATE is asserted: 16 ticks a cell, one byte an interval, DMA into an 80 KB buffer. Core 1 notes where on the track the write began.
+  - **Decoding:** core 0 decodes each burst. `mfm_decode` is a data separator (a PLL with Greaseweazle's gains) and a field scanner. `track_write` places each data field: by position for a single-sector write, as a PC's controller makes it, and by its ID field for a whole-track write such as FORMAT or `gw write`.
+  - **Storing:** written sectors go into the live track at once, so a verify read sees them, and through to the image on the card, synced.
+  - **Write protection:** an image is writable unless the file is marked read-only; the generated disk stays write-protected.
+  - **Console:** `s` adds `writable`, `written`, `write_bad_crc`, `write_unplaced`, `bursts_dropped` and `write_us_max`; `i` shows `writable`.
+- **Host tests, all without hardware:**
+  - The data separator tolerates about 0.2 cell of random jitter on every edge and a host clock about 10% off. Both were measured, not assumed.
+  - Every track Greaseweazle's encoder makes decodes exactly (`test/tools/decode_write`).
+  - The WDATA program, in the simulator, measures intervals to within a tick with no bias, and a sector write it captures decodes into the right sector.
+  - The whole write path, end to end.
+- The PIO simulator gains `IN` and autopush. Rig tests for slice 5 (`-m slice5`) write random tracks with `gw write`, read them back, and restore the originals.
+- A synthesised stand-in sample pack in `samples/Placeholder/`, until a real drive is recorded. It has `spinup`, `spin` (loop), `spindown`, `step`, `seek` (loop), `bump`, `insert` and `eject`, as mono 16-bit 22.05 kHz WAVs.
+- `scripts/make_placeholder_samples.py` regenerates the pack the same way every time; `--demo` writes a short session to listen to.
+
+### Changed
+- `rdata::clockDivider` takes the program's cycles per cell.
+
+## [0.5.0] - 2026-10-23
+
+### Added
+- **Slice 4, sound events (`bb48_drive` build, now `FIRMWARE_SLICE` 4).**
+  - **Core 1:** watches the drive model for motor, step (with its outcome and cylinder) and disk changes, and passes them to core 0 on a ring.
+  - **Core 0:** turns them into `ACT` lines: `MOTOR_ON`, `MOTOR_OFF`, `STEP`, `SEEK_START`, `SEEK_END`, `BUMP`, `INSERT` and `EJECT`. Steps closer than 20 ms make a seek, and further apart they're separate clicks. A step against an end stop is a `BUMP`, not a click.
+  - `s` adds `clicks`, `seeks`, `bumps` and `act_dropped`. See `docs/activity.md`, which also proposes an FDD sample pack.
+- **Host tests:** the tracker and observer on their own, then fed through the drive model by the virtual hosts. A Greaseweazle's seek is one seek, the Feather's 26 ms steps are clicks, and a blind recalibrate grinds the stop.
+- The trace parser reads `ACT` lines; rig tests for slice 4 (`-m slice4`) check that the sounds account for every step on the cable.
+
+### Changed
+- The virtual hosts moved to `test/native/virtual_hosts.h`, with an optional per-sample hook.
+
+## [0.4.0] - 2026-10-23
+
+### Added
+- **Slice 3, images on the SD card (`bb48_drive` build, now `FIRMWARE_SLICE` 3).**
+  - **The image:** at power-on the drive mounts the card over 4-bit SDIO (GPIO 32–37) and serves the first `.img`/`.ima` in the root, in name order, that is 720 KB or 1.44 MB. The format and data rate follow the file size. Without a card or an image, it serves the generated disk as before.
+  - **Loading:** `cylinder_loader` reads both tracks of the cylinder under the head and encodes them into the RDATA buffer in four steps, one per pass of core 0's loop. If the head moves mid-load, it starts again for the new cylinder.
+  - **RDATA:** stays released until the buffer holds the cylinder under the head. Stale sector IDs would look like a seek error to the host.
+  - **Cylinders 80–83:** the image has no data there, so those cylinders get a blank track.
+- Console `i` names the image; `s` adds `ready`, `loads`, `restarts`, `read_us_max` and `encode_us_max`.
+- Host tests for image geometry and the loader. A timing simulation checks that a cylinder is ready within the host's 15 ms settle time after any seek at PC, Greaseweazle and Feather step rates, with SDIO-speed reads. It also shows that SPI-speed reads miss it.
+- `python -m fddproto.make_images <folder>` writes test images for the card. Rig tests for slice 3 (`-m slice3`) compare the host's reads with them.
+
+### Changed
+- The rig's host is now a Feather RP2040 + Adafruit Floppy FeatherWing running Adafruit's Greaseweazle-compatible firmware. A Greaseweazle is optional.
+  - `gw` defaults to drive A, the Feather's only select, which uses pins 12/16.
+  - The slice 0 drive-letter test accepts a host that refuses one letter.
+  - The input pull-ups become a socketed SIP network: 10 kΩ with the FeatherWing (its outputs are 5 V), 1 kΩ for a real PC.
+
+### Added
+- `VirtualAdafruitFloppy` in the C++ tests, following Adafruit_Floppy's seek, step and motor timing. The drive meets it as it meets the virtual Greaseweazle.
+
+- The RDATA streamer claims PIO 2 or 1, never 0, which SdFat's SDIO driver takes for the GPIO 16–47 window.
+- Slice 2's rig tests skip when an image is on the card.
+
+## [0.3.0] - 2026-10-23
+
+### Added
+- **Slice 2, RDATA (`bb48_drive` build, now `FIRMWARE_SLICE` 2).** The drive streams the generated 1.44 MB disk:
+  - `fdd_rdata.pio` sends one flux pulse per 1 cell: 375 ns low, in a 1 µs slot (HD).
+  - Both heads of the cylinder are interleaved in one stream. The program reads SIDE1 on every cell, so a head switch takes effect on the next cell, in step with the rotation.
+  - Two DMA channels loop over the 50 KB cylinder buffer. The stream restarts from the first cell at each index pulse.
+  - RDATA is held released unless the drive is selected, has a disk and is at speed.
+  - Core 0 rebuilds the buffer in place when the head moves; `s` shows the cylinder built and how long the build took.
+- The track encoder, all pure C++:
+  - `crc16`: CRC-16-CCITT as IBM formats use it;
+  - `mfm`: MFM encoding, with the A1 and C2 sync words;
+  - `ibm_track`: one track of a 1.44 MB or 720 KB disk, in Greaseweazle's `ibm.1440` and `ibm.720` layouts;
+  - `rdata_stream`: the interleaved cylinder, and the PIO clock divider for a data rate;
+  - `gen_disk`: the generated test disk, with the same pattern and known answers as HDDSynthPro's, and a Python twin.
+- `test/tools/build_track` writes every track of a disk (generated or from an IMG file), or one cylinder as the streamer is fed it.
+- Tests with no hardware (`-m sim`):
+  - `test_track_encoder.py` checks every track of four disks (generated and random, both formats) against Greaseweazle: its encoder produces the same cells, and its decoder reads ours back to the original data.
+  - `test_rdata_sim.py` runs the real PIO program in the simulator. It checks that every pulse lands on the right cell for either head, and that a head switch keeps the phase. It also checks that Greaseweazle decodes sectors from the pulse timings alone, and that a starved FIFO leaves RDATA released.
+  - `pio_sim.py`, copied from HDDSynthPro, gains left shifts, autopull and the programs' `.define public` values.
+- Rig tests for slice 2 (`-m slice2`): ten full reads, random single tracks, the cylinder build time against the settle time, and RPM.
+
+## [0.2.0] - 2026-10-23
+
+### Added
+- **Slice 1, the drive (`bb48_drive` build).** Answers on drive select B / motor B (floppy pins 12/16, a PC drive's own), with a read-only disk in from power-on:
+  - the head follows STEP and DIR while selected, between cylinder 0 and an inner stop at 83. A step outwards at cylinder 0 is a knock against the outer stop, counted for the sounds;
+  - TRK00 on cylinder 0;
+  - INDEX: a 2 ms pulse every 200 ms (300 RPM) while the motor is on and a disk is in;
+  - WPT for a read-only disk or no disk;
+  - DSKCHG from power-on and after an eject, cleared by a step with a disk in;
+  - every output released while the drive is deselected.
+- Console `d` ejects or inserts the disk; `s` adds the cylinder, side, selection, disk and knock counts.
+- `head`, `rotation` and `drive`: the drive's logic as pure C++, with host tests. These include a virtual Greaseweazle that seeks and measures RPM the way its firmware does.
+- Rig tests for slice 1 (`-m slice1`): seeking to every cylinder and back, full sweeps, the TRK00, WPT and DSKCHG lines, and `gw rpm`.
+
+## [0.1.0] - 2026-10-22
+
+### Added
+- **Slice 0, listen only (`bb48` build).** Core 1 polls the ten floppy inputs and records:
+  - every change of drive select, motor enable, side, density and write gate, as `SIG` lines;
+  - every step, merged into one `STEP` line per run of steps in the same direction.
+  - Every pin stays an input; the SN7407's outputs stay released.
+- Console: `h` help, `p` input levels, `s` stats, `m` mark, `x`/`Y` the solder-bridge test, `b` bootloader.
+- Host-side C++ tests for the pin layout, the pin watcher, the trace format and coalescer, the SPSC ring and the solder-bridge analysis.
+- Host tools: the trace parser, a Greaseweazle wrapper, and rig tests for slice 0 (`-m slice0`).
+- A `gw convert` round-trip test, the base for checking the MFM encoder in slice 2.
+- Docs: the plan, the wiring and the bring-up checklist.

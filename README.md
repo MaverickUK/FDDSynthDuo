@@ -43,7 +43,7 @@
 | [SynthMinder](docs/synthminder.md) | Setting the drive up from DOS, through cylinder 82 |
 | [Wiring](docs/wiring.md) and [the hardware](hardware/README.md) | The connections, the carrier board, and [rev C](docs/pcb-revc.md) |
 | [Building and testing](docs/building.md) | The builds, the tests, the rig, and the deeper technical pages |
-| [Changelog](CHANGELOG.md) | Every release |
+| [Changelog](firmware/CHANGELOG.md) | Every release |
 
 ## The Synth family
 

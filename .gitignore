@@ -1,0 +1,37 @@
+.DS_Store
+.vscode/
+__pycache__/
+.pytest_cache/
+
+# Firmware
+firmware/.pio/
+firmware/host/runs/
+firmware/host/.venv/
+firmware/host/rig.env
+firmware/src/*.pio.h
+firmware/src/welcome_text.h
+
+# KiCad: per-user and generated files
+*.kicad_prl
+*-backups/
+fp-info-cache
+_autosave-*
+\#auto_saved_files\#
+hardware/fab/
+hardware/*_fab.zip
+~*.lck
+*.kicad_pcb.zip
+# KiCad exports made by hand (a 3D STEP, the Fabrication Toolkit's set):
+# hardware/build.sh writes the ones to use, into hardware/jlc/.
+hardware/*.step
+hardware/production/
+hardware/revc/*.step
+hardware/revc/production/
+# KiCad's local history snapshots
+.history/
+# The slice 0 reference traces: the first set was recorded with DIR broken.
+# Unignore this once valid ones are recorded on the carrier.
+firmware/host/reference/
+# kicad-cli's ERC/DRC reports (hardware/revc/build.sh writes them on every run)
+*-drc.rpt
+*-erc.rpt

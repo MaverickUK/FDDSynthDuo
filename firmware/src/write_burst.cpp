@@ -1,0 +1,173 @@
+#include "write_burst.h"
+
+#include "fdd_signals.h"
+#include "ram_func.h"
+
+WriteGate::Action WriteGate::onSample(uint32_t now_us, uint32_t pins, drive::Drive& d, bool buffer_free,
+                                      uint32_t data_rate_bps, WriteBurst& burst) {
+    bool gate = fdd::asserted(pins, cfg::PIN_WGATE);
+    if (!gate || !d.selected()) {
+        missed_ = false;
+        if (!capturing_) return Action::None;
+        capturing_ = false;
+        return Action::Stop;
+    }
+    if (capturing_ || missed_ || !d.mediaPresent() || d.writeProtected()) return Action::None;
+    if (!buffer_free) {
+        missed_ = true;
+        return Action::Missed;
+    }
+    // Where on the track the write begins: it places a sector write.
+    uint32_t start_byte = uint32_t(uint64_t(d.spindle().phaseUs(now_us)) * data_rate_bps / 8000000u);
+    burst = WriteBurst{d.head().cylinder(), d.side(), start_byte, burst.intervals, 0};
+    capturing_ = true;
+    return Action::Start;
+}
+
+BurstResult BurstWriter::apply(const WriteBurst& burst, uint32_t ticks_per_cell, uint32_t edge_ticks) {
+    begin(burst, ticks_per_cell, edge_ticks);
+    feed(burst.intervals, burst.count);
+    return finish();
+}
+
+void BurstWriter::begin(const WriteBurst& burst, uint32_t ticks_per_cell, uint32_t edge_ticks) {
+    burst_ = burst;
+    edge_ticks_ = edge_ticks;
+    // Data fields are this track's sector size, unless an ID field says
+    // otherwise; FM or MFM; and its cells at its own rate (a track at half
+    // the disk's has cells twice as long).
+    const ibm::Format& fmt = source_.format();
+    amiga_disk_ = fmt.encoding == ibm::ENCODING_AMIGA;
+    amiga_.reset();
+    raw_disk_ = fmt.encoding == ibm::ENCODING_RAW;
+    raw_words_ = raw_bits_ = 0;
+    raw_word_ = 0;
+    int cylinder = fmt.imageCylinder(burst.cylinder);
+    const ibm::Track& t = fmt.track(cylinder < 0 ? 0 : uint8_t(cylinder), burst.head);
+    separator_.reset(ticks_per_cell * t.scale);
+    scanner_.reset(uint16_t(t.sectorBytes()), t.fm);
+}
+
+// In RAM, with the separator and the scanner inlined: it runs for every flux
+// edge of a write, and must keep up with the capture (an HD write is about
+// 370 KB/s of intervals); from flash, cell by cell, it managed 200.
+RAM_FUNC(burst_feed) void BurstWriter::feed(const uint8_t* intervals, size_t count) {
+    if (!raw_disk_ && !amiga_disk_) {
+        for (size_t i = 0; i < count; ++i) scanner_.addInterval(separator_.cells(uint32_t(intervals[i]) + edge_ticks_));
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        unsigned n = separator_.cells(uint32_t(intervals[i]) + edge_ticks_);
+        if (raw_disk_) {
+            rawInterval(n);
+            continue;
+        }
+        amiga_.addInterval(n);  // an Amiga disk
+    }
+}
+
+track_write::Result BurstWriter::interpretAmiga(const ibm::Format& fmt, int cylinder, uint8_t head,
+                                                track_write::Update* out, size_t max) const {
+    track_write::Result r;
+    bool on_track = cylinder >= 0 && hasTrack(fmt, uint8_t(cylinder), head);
+    unsigned sectors = on_track ? fmt.track(uint8_t(cylinder), head).sectors : 0;
+    for (size_t i = 0; i < amiga_.count(); ++i) {
+        const amiga::SectorScanner::Sector& s = amiga_.sector(i);
+        if (!s.ok) {
+            ++r.bad_crc;
+            continue;
+        }
+        if (!on_track || s.track != cylinder * 2 + head || s.sector >= sectors) {
+            ++r.unplaced;
+            continue;
+        }
+        if (r.updates < max) out[r.updates++] = track_write::Update{s.sector, s.data_offset};
+    }
+    return r;
+}
+
+BurstResult BurstWriter::finishRaw(const ibm::Format& fmt) {
+    BurstResult r;
+    uint16_t* words = reinterpret_cast<uint16_t*>(store_);
+    uint32_t n = raw_words_ < store_len_ / 2 ? raw_words_ : uint32_t(store_len_ / 2);
+    if (n > fmt.track_bytes) n = fmt.track_bytes;  // a revolution's worth: the rest went over its own start
+    int cylinder = fmt.imageCylinder(burst_.cylinder);
+    if (!n) return r;
+    if (cylinder < 0 || !hasTrack(fmt, uint8_t(cylinder), burst_.head)) {
+        r.decoded.unplaced = 1;
+        return r;
+    }
+    r.decoded.updates = 1;
+    // The disk first, as the file stores cells (MSB first, two bytes a word);
+    // round the end of the track, from the word under the head at WGATE.
+    const uint32_t track = fmt.track_bytes, first = burst_.start_byte % track;
+    for (uint32_t i = 0; i < n; ++i) {
+        uint16_t w = words[i];
+        store_[2 * i] = uint8_t(w >> 8);
+        store_[2 * i + 1] = uint8_t(w);
+    }
+    // In pieces that end on 4 KB boundaries of the track (an HFE file's
+    // 16-block groups), giving the audio a turn between them: a whole track
+    // to the card takes 80 ms or more.
+    auto write = [&](uint32_t at, const uint8_t* data, uint32_t bytes) {
+        constexpr uint32_t PIECE = 4096;
+        while (bytes) {
+            uint32_t run = PIECE - at % PIECE;
+            if (run > bytes) run = bytes;
+            if (between_writes) between_writes();
+            if (!source_.writeTrackBytes(uint8_t(cylinder), burst_.head, at, data, run)) return false;
+            at += run;
+            data += run;
+            bytes -= run;
+        }
+        return true;
+    };
+    uint32_t part = n < track - first ? n : track - first;
+    bool ok = write(first * 2, store_, part * 2) && (part == n || write(0, store_ + part * 2, (n - part) * 2));
+    for (uint32_t i = 0; i < n; ++i) words[i] = uint16_t(store_[2 * i] << 8 | store_[2 * i + 1]);
+    if (!ok) {
+        r.failed = 1;  // the live track keeps the old cells: what the disk has
+        return r;
+    }
+    r.persisted = 1;
+    r.patched = loader_.writeCells(burst_.cylinder, burst_.head, first, words, n);
+    return r;
+}
+
+BurstResult BurstWriter::finish() {
+    const ibm::Format& fmt = source_.format();
+    if (raw_disk_) return finishRaw(fmt);
+    BurstResult r;
+    // The head's cylinder (the loader's), and the image's (the disk's).
+    int cylinder = fmt.imageCylinder(burst_.cylinder);
+    track_write::Update updates[64];
+    if (amiga_disk_)
+        r.decoded = interpretAmiga(fmt, cylinder, burst_.head, updates, 64);
+    else
+        r.decoded = track_write::interpret(fmt, cylinder, burst_.head, burst_.start_byte, scanner_, updates, 64);
+    // Every sector to the disk, then one flush, then the live track: only
+    // sectors the disk has for good are shown to the host. A sector the
+    // disk refused keeps the old data in the live track: what the disk has.
+    bool stored[64] = {};
+    for (unsigned i = 0; i < r.decoded.updates; ++i) {
+        if (between_writes) between_writes();
+        stored[i] = source_.writeSector(uint8_t(cylinder), burst_.head, updates[i].sector, store_ + updates[i].data_offset);
+        if (stored[i])
+            ++r.persisted;
+        else
+            ++r.failed;
+    }
+    if (between_writes) between_writes();
+    if (r.persisted && !source_.flush()) {
+        r.failed += r.persisted;  // none of them is safely on the disk
+        r.persisted = 0;
+        return r;
+    }
+    // Into the track data, then one encode of the head for them all.
+    for (unsigned i = 0; i < r.decoded.updates; ++i)
+        if (stored[i])
+            r.patched += loader_.storeSector(burst_.cylinder, burst_.head, updates[i].sector,
+                                             store_ + updates[i].data_offset);
+    if (r.patched && !loader_.encodeHead(burst_.cylinder, burst_.head)) r.patched = 0;
+    return r;
+}

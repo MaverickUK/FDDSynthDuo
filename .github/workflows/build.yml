@@ -1,0 +1,123 @@
+# Build the firmware and run every test that needs no hardware, on each push
+# and pull request, in two jobs side by side. A tag vX.Y.Z also publishes a
+# GitHub release with the UF2s, after checking that the tag matches
+# FIRMWARE_VERSION in firmware/src/version.h.
+# The firmware lives in firmware/; the jobs run there.
+#
+# The Greaseweazle comparison checks a spread of tracks on routine runs and
+# all 160 on tags, or when run by hand with "full tracks" ticked.
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      full_tracks:
+        description: Compare every track with Greaseweazle's encoder
+        type: boolean
+        default: true
+
+defaults:
+  run:
+    working-directory: firmware
+
+jobs:
+  firmware:
+    name: Firmware
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/cache@v6
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('firmware/platformio.ini') }}
+      - run: pip install platformio
+      - run: pio run -e bb48 -e bb48_drive -e bb48_direct -e bb48_drive_direct
+
+      - name: Read the firmware version
+        id: version
+        run: |
+          version=$(sed -n 's/.*FIRMWARE_VERSION "\(.*\)".*/\1/p' src/version.h)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Firmware version $version"
+
+      - name: Check the tag matches the firmware version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "v${{ steps.version.outputs.version }}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match FIRMWARE_VERSION ${{ steps.version.outputs.version }} in firmware/src/version.h"
+            exit 1
+          fi
+
+      - name: Name the UF2s
+        run: |
+          mkdir dist
+          cp .pio/build/bb48/firmware.uf2 "dist/fddsynthpro-bb48-listen-v${{ steps.version.outputs.version }}.uf2"
+          cp .pio/build/bb48_drive/firmware.uf2 "dist/fddsynthpro-bb48-drive-v${{ steps.version.outputs.version }}.uf2"
+          cp .pio/build/bb48_direct/firmware.uf2 "dist/fddsynthpro-bb48-listen-direct-v${{ steps.version.outputs.version }}.uf2"
+          cp .pio/build/bb48_drive_direct/firmware.uf2 "dist/fddsynthpro-bb48-drive-direct-v${{ steps.version.outputs.version }}.uf2"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: firmware-v${{ steps.version.outputs.version }}
+          path: firmware/dist/*.uf2
+
+  tests:
+    name: Host tests
+    runs-on: ubuntu-latest
+    env:
+      # pioasm for the PIO simulator tests: the same build PlatformIO uses,
+      # without the rest of the toolchain.
+      PIOASM_URL: https://github.com/earlephilhower/pico-quick-toolchain/releases/download/5.0.0/x86_64-linux-gnu.pioasm-98a542c1.260719.tar.gz
+      FDDPRO_FULL_TRACKS: ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.full_tracks) && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: firmware/host/requirements.txt
+      - run: pip install -r host/requirements.txt
+      # mtools and fsck.fat check the virtual PC's DOS sessions (test_dos_disk.py).
+      - run: sudo apt-get install -y mtools dosfstools
+      - name: Fetch pioasm
+        run: |
+          curl -sfL "$PIOASM_URL" | tar xz -C "$RUNNER_TEMP"
+          echo "PIOASM=$RUNNER_TEMP/pioasm/pioasm" >> "$GITHUB_ENV"
+
+      - name: C++ unit tests
+        run: test/run_native_tests.sh
+      - name: Simulator and parser tests
+        working-directory: firmware/host
+        run: pytest -m sim
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [firmware, tests]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: firmware-v${{ needs.firmware.outputs.version }}
+          path: dist
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/*.uf2 \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

@@ -1,0 +1,1765 @@
+// FDDSynthPro floppy drive emulator prototype.
+//
+// Two builds (FIRMWARE_SLICE, set in platformio.ini):
+//   bb48        slice 0, listen only: core 1 polls the interface pins and
+//               records select, motor, side, write gate and density changes,
+//               and every step. Every pin stays an input; the SN7407 outputs
+//               stay released.
+//   bb48_drive  slices 1-5, the drive: core 1 also runs the drive model
+//               (drive.h) and puts INDEX, TRK00, WPT and DSKCHG on the
+//               SN7407, and the RDATA streamer (rdata_pio.h) sends the
+//               cylinder under the head. Core 0 loads it (cylinder_loader.h)
+//               from the first image on the SD card, copied into PSRAM
+//               before the disk goes in (image_cache.h), or from the
+//               generated 1.44 MB disk without one. A read-only disk is in from
+//               power-on, writable if the image is. Console `[` and `]`
+//               swap to the previous or next image on the card, GoTek
+//               style. What the drive does
+//               becomes sound events (activity.h), printed as ACT lines for
+//               the FDD Synth, and played: the mixer (synth.h) sounds them
+//               with the card's sample pack through an I2S amp (audio.h).
+//               The front panel (panel.h) shows the drive on an OLED; its
+//               encoder sets the volume and picks the disk.
+//               Writes: core 1 captures WDATA while WGATE is
+//               asserted (wdata_pio.h); core 0 decodes each burst and puts
+//               the sectors in the live track and on the card
+//               (write_burst.h).
+// In both, core 1 records events into the trace ring and core 0 owns USB
+// serial: it prints the trace and runs the console.
+#include <Arduino.h>
+
+#include <hardware/gpio.h>
+#include <hardware/regs/addressmap.h>
+
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+
+#include "config.h"
+#include "drive.h"
+#include "fdd_signals.h"
+#include "pin_watch.h"
+#include "short_test.h"
+#include "spsc_ring.h"
+#include "trace_format.h"
+#include "version.h"
+
+#if FIRMWARE_SLICE != 0
+#include "activity.h"
+#include "audio.h"
+#include "cylinder_loader.h"
+#include "ibm_track.h"
+#include "image_cache.h"
+#include "panel.h"
+#include "amiga_pio.h"
+#include "rdata_pio.h"
+#include "rdata_stream.h"
+#include "sd_image.h"
+#include "settings.h"
+#include "synth.h"
+#include "track_source.h"
+#include "welcome_disk.h"
+#include "welcome_text.h"
+#include "wdata_pio.h"
+#include "write_burst.h"
+#include "duo_commands.h"
+#include "mailbox.h"
+#endif
+
+static SpscRing<TraceEvent, cfg::TRACE_RING_EVENTS> g_trace;
+static std::atomic<uint32_t> g_events{0};   // recorded by core 1
+static std::atomic<uint32_t> g_dropped{0};  // lost because the ring was full
+static std::atomic<uint32_t> g_steps{0};    // STEP assertions seen
+
+// Pins in sample layout (bit n = GPIO BUS_FIRST_PIN + n).
+static uint32_t pinsAsSample() { return gpio_get_all() >> cfg::BUS_FIRST_PIN; }
+
+// Whether STEP has been asserted (a falling edge) since the last call. The
+// GPIO block latches edges in its raw interrupt status whether or not the
+// interrupt is enabled, so a pulse shorter than one of core 1's passes isn't
+// lost: a PC's controller pulses STEP for a few microseconds, and a pass that
+// restarts the stream at the index takes longer than that (0.23.8).
+static bool takeStepEdge() {
+    constexpr unsigned SHIFT = 4 * (cfg::PIN_STEP % 8);
+    if (!(io_bank0_hw->intr[cfg::PIN_STEP / 8] & (GPIO_IRQ_EDGE_FALL << SHIFT))) return false;
+    gpio_acknowledge_irq(cfg::PIN_STEP, GPIO_IRQ_EDGE_FALL);
+    return true;
+}
+
+constexpr uint32_t OUTPUT_GPIO_MASK = fdd::OUTPUT_MASK << cfg::BUS_FIRST_PIN;
+
+static void record(const TraceEvent& e) {
+    g_events.fetch_add(1, std::memory_order_relaxed);
+    if (!g_trace.push(e)) g_dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+// ---- Core 1 ---------------------------------------------------------------------
+
+static void setUpInputs() {
+    for (unsigned pin = cfg::FIRST_INPUT_PIN; pin <= cfg::LAST_INPUT_PIN; ++pin) {
+        gpio_init(pin);           // SIO input
+        gpio_disable_pulls(pin);  // the pull-ups are on the board
+    }
+}
+
+// Records what the pin watcher saw: select/motor/side changes and steps.
+static void watch(PinWatch& w, uint32_t now, uint32_t pins) {
+    TraceEvent out[2];
+    unsigned n = w.onSample(now, pins, out);
+    for (unsigned i = 0; i < n; ++i) {
+        if (out[i].kind == TraceKind::Step) g_steps.fetch_add(1, std::memory_order_relaxed);
+        record(out[i]);
+    }
+}
+
+#if FIRMWARE_SLICE == 0
+
+void setup1() {
+    setUpInputs();
+    for (unsigned pin : cfg::OUTPUT_PINS) {
+        // Inputs too in slice 0. Through the SN7407, the pull-up holds its
+        // input high, so its output stays released. Wired straight to the
+        // header, the host pulls them up (to 5 V), so ours stay off. Never
+        // pull-downs (erratum E9).
+        gpio_init(pin);
+        gpio_set_pulls(pin, !cfg::OUTPUTS_OPEN_DRAIN, false);
+    }
+}
+
+void loop1() {
+    // Never returns: one tight polling loop. A pass takes well under a
+    // microsecond, and the shortest pulse watched (STEP) lasts at least one.
+    PinWatch w(pinsAsSample());
+    for (;;) watch(w, time_us_32(), pinsAsSample());
+}
+
+#else
+
+// Each drive the emulator is (bus.h: one or two): what core 1 shares with
+// core 0. Written by core 1, except the requests (disk_request, swap),
+// which core 0 sets and core 1 takes, and what core 0 chooses before core 1
+// starts (format, writable).
+enum SwapState : int { SWAP_NONE, SWAP_EJECT, SWAP_EJECTED, SWAP_INSERT };
+
+struct DriveShared {
+    std::atomic<uint8_t> cylinder{0};
+    std::atomic<bool> selected{false};
+    std::atomic<bool> disk_in{false};
+    std::atomic<uint32_t> outer_knocks{0};  // steps out at cylinder 0
+    std::atomic<uint32_t> inner_knocks{0};  // steps in at the last cylinder
+    std::atomic<int> disk_request{0};       // console `d`, the panel: +1 insert, -1 eject
+    // For the front panel.
+    std::atomic<bool> write_protected{false};
+    std::atomic<bool> writing{false};    // a write burst being captured
+    std::atomic<bool> streaming{false};  // RDATA carrying its track
+    // A disk swap (console `[` / `]`, the panel): core 0 asks for an eject,
+    // core 1 ejects, core 0 opens the new image and loads the cylinder under
+    // the head, core 1 retunes the PIO programs if the data rate changed and
+    // inserts it.
+    std::atomic<int> swap{SWAP_NONE};
+    // A lost write (write_burst.h: lostWrite): core 0 sets it, core 1 then
+    // reports write-protect until the disk is inserted again.
+    std::atomic<bool> write_fault{false};
+    // Set by core 0 once it has chosen the disk (and at each swap): what
+    // core 1 needs of its format. Core 0 owns the format itself, which a
+    // swap rewrites.
+    std::atomic<uint32_t> rate{0};           // data bits per second
+    std::atomic<uint32_t> words{0};          // track_bytes: cell words a revolution
+    std::atomic<uint32_t> period_us{0};      // a revolution
+    std::atomic<uint32_t> last_cylinder{0};  // the last the head reaches on this disk
+    std::atomic<bool> writable{false};
+};
+
+// What core 1 keeps of a drive's disk: its timing, as last published.
+struct DiskTiming {
+    uint32_t rate, words, period_us, last_cylinder;
+    bool operator!=(const DiskTiming& o) const {
+        return rate != o.rate || words != o.words || period_us != o.period_us || last_cylinder != o.last_cylinder;
+    }
+};
+
+static DiskTiming timingOf(const DriveShared& s) {
+    return DiskTiming{s.rate.load(), s.words.load(), s.period_us.load(), s.last_cylinder.load()};
+}
+static DriveShared g_shared[bus::MAX_DRIVES];
+static std::atomic<uint8_t> g_side{0};  // the host's SIDE1, the same for both drives
+static std::atomic<bool> g_host_off{false};  // every line low: the computer is off (fdd::hostOff)
+
+// What the drive did, from core 1 to core 0's activity tracker.
+static SpscRing<activity::DriveEvent, 256> g_drive_events;
+static std::atomic<uint32_t> g_drive_events_dropped{0};
+
+// Each drive's cylinder, as the RDATA streamer sends it: both heads,
+// interleaved (rdata_stream.h), sized for the largest format. Core 0's
+// loader rebuilds it in place when the head moves; the DMA streams the
+// selected drive's.
+// The first drive's are static; a second drive's (77 KB with its track
+// data) are allocated at power-on, only when one is set up (chooseDisks).
+static uint32_t g_slots0[ibm::MAX_TRACK_WORDS];
+
+// Where the RDATA DMA is in a drive's buffer, so a write is shown without
+// tearing the sector the host is reading (cylinder_loader.h).
+struct DmaPosition final : StreamPosition {
+    uint32_t nextWord(const uint32_t* slots) const override { return rdata_pio::nextWord(slots, ibm::MAX_TRACK_WORDS); }
+};
+static DmaPosition g_dma_position;
+static uint32_t* g_cylinder_slots[bus::MAX_DRIVES] = {g_slots0};
+
+// Set by core 0 in setup() (chooseDisk): the drives, how they sit on the
+// cable, and their loaders. Core 1 waits for g_started.
+static unsigned g_drive_count = 1;
+static drive::Config g_drive_config[bus::MAX_DRIVES];
+static bus::Interface g_interface = bus::Interface::IbmPc;
+static bool g_pin2_chng = false;  // floppy pin 2 driven as DISK CHANGE (bus.h)
+static bool g_amiga_edges = false;  // core 1: an Amiga drive's selects and steps from amiga_pio
+static CylinderLoader* g_loaders[bus::MAX_DRIVES];
+static std::atomic<bool> g_started{false};
+// How far core 1 has got: 1 set up, 2 released, 3 streamer, 4 capture, 5 running.
+static std::atomic<int> g_core1_stage{0};
+static uint32_t core0StackUsed();
+
+// Writes stream from core 1's capture to core 0's decoder through a ring
+// (CaptureStream, write_burst.h): the DMA fills it, core 1 marks where each
+// burst starts and ends and how far the DMA has got, core 0 decodes behind.
+// Only the selected drive writes, so one capture serves both.
+static uint8_t g_capture_ring[cfg::CAPTURE_RING_BYTES] __attribute__((aligned(cfg::CAPTURE_RING_BYTES)));
+static SpscRing<CaptureStream::Mark, 16> g_capture_marks;
+static std::atomic<uint32_t> g_capture_produced{0};
+static std::atomic<uint32_t> g_bursts_dropped{0};  // WGATE with no room for its marks
+
+static void setUpOutputs() {
+    gpio_init_mask(OUTPUT_GPIO_MASK);
+    if (cfg::OUTPUTS_OPEN_DRAIN) {
+        // Straight to the header: the level is always low, and a line is
+        // asserted by enabling the output. All start as inputs (released),
+        // with no pulls: the host pulls the lines up. 12 mA for the lowest
+        // low level against the host's pull-ups.
+        gpio_put_masked(OUTPUT_GPIO_MASK, 0);
+        gpio_set_dir_in_masked(OUTPUT_GPIO_MASK);
+        for (unsigned pin : cfg::OUTPUT_PINS) {
+            gpio_disable_pulls(pin);
+            gpio_set_drive_strength(pin, GPIO_DRIVE_STRENGTH_12MA);
+        }
+    } else {
+        // Released (high) before they become outputs, so the cable never sees
+        // a glitch. They only ever drive the SN7407's inputs.
+        gpio_put_masked(OUTPUT_GPIO_MASK, OUTPUT_GPIO_MASK);
+        gpio_set_dir_out_masked(OUTPUT_GPIO_MASK);
+    }
+}
+
+// `levels`: the output pins in sample layout, high = released (drive.h).
+static void putOutputs(uint32_t levels) {
+    uint32_t gpio = levels << cfg::BUS_FIRST_PIN;
+    if (cfg::OUTPUTS_OPEN_DRAIN)
+        gpio_set_dir_masked(OUTPUT_GPIO_MASK, ~gpio & OUTPUT_GPIO_MASK);  // output = asserted (low)
+    else
+        gpio_put_masked(OUTPUT_GPIO_MASK, gpio);
+}
+
+void setup1() {
+    setUpInputs();
+    setUpOutputs();
+    g_core1_stage.store(1);
+    // RDATA then moves to the PIO, held released until the drive is ready.
+    // The data rate depends on the disk, which core 0 chooses after mounting
+    // the SD card. The streamer starts on drive 0's.
+    while (!g_started.load(std::memory_order_acquire)) tight_loop_contents();
+    g_core1_stage.store(2);
+    DiskTiming disk = timingOf(g_shared[0]);
+    rdata_pio::begin(g_cylinder_slots[0], disk.words, disk.rate);
+    g_core1_stage.store(3);
+    wdata_pio::begin(g_capture_ring, cfg::CAPTURE_RING_BYTES, disk.rate);
+    // An Amiga's selects and steps are too short for core 1's loop alone
+    // (amiga_pio.h). One drive: two would need two selects in the gate.
+    if (g_interface == bus::Interface::Amiga && g_drive_count == 1)
+        g_amiga_edges = amiga_pio::begin(g_drive_config[0].lines.select);
+    g_core1_stage.store(4);
+}
+
+// Where drive `d`'s disk is under its head, in streamer words (one per
+// encoded byte) from its index.
+static uint32_t wordUnderHead(drive::Drive& d, uint32_t now, uint32_t data_rate) {
+    return uint32_t(uint64_t(d.spindle().phaseUs(now)) * data_rate / 8000000u);
+}
+
+void loop1() {
+    // Never returns. Each pass: sample the inputs, update the drives, put
+    // their outputs on the pins. The index pulse is timed from this loop, so
+    // its edges are late by at most one pass (well under a microsecond).
+    const unsigned n = g_drive_count;
+    static drive::Drive d0(g_drive_config[0]), d1(g_drive_config[1]);
+    drive::Drive* drives[bus::MAX_DRIVES] = {&d0, &d1};
+    DiskTiming disk[bus::MAX_DRIVES];
+    bool write_protected[bus::MAX_DRIVES];
+    for (unsigned i = 0; i < n; ++i) {
+        disk[i] = timingOf(g_shared[i]);
+        drives[i]->setGeometry(disk[i].period_us, disk[i].last_cylinder);
+        write_protected[i] = !g_shared[i].writable.load();
+        drives[i]->insertDisk(write_protected[i]);
+        g_shared[i].disk_in.store(true);
+    }
+    // The drive the streamer and the capture serve: the selected one, else
+    // the last selected.
+    unsigned active = 0;
+    uint32_t data_rate = disk[0].rate;
+    PinWatch w(pinsAsSample());
+    activity::DriveObserver observer;
+    bool index_was = false;
+    bool streaming = false;
+    WriteGate write_gate;
+    WriteBurst burst{};
+    g_core1_stage.store(5);
+    for (unsigned i = 0; i < n; ++i) drives[i]->useStepLatch(true);
+    if (g_amiga_edges) d0.useEdgeSamples(true);
+    takeStepEdge();  // forget any edge from before the loop
+    for (;;) {
+        uint32_t now = time_us_32();
+        bool step_edge = takeStepEdge();
+        uint32_t pins = pinsAsSample();
+        // A switched-off computer holds every line low: the drive takes them
+        // as released, and the trace shows them so
+        bool host_off = fdd::hostOff(pins);
+        if (host_off) {
+            pins |= fdd::INPUT_MASK;
+            step_edge = false;
+        }
+        if (host_off != g_host_off.load(std::memory_order_relaxed)) g_host_off.store(host_off, std::memory_order_relaxed);
+        watch(w, now, pins);
+
+        drive::StepEvent e;
+        for (unsigned i = 0; i < n; ++i) {
+            DriveShared& s = g_shared[i];
+            auto stepped = [&](const drive::StepEvent& each) {
+                if (!each.stepped) return;  // only a selected drive steps
+                e = each;
+                s.cylinder.store(each.cylinder, std::memory_order_relaxed);
+                if (each.outcome == head::Step::AtOuterStop) s.outer_knocks.fetch_add(1, std::memory_order_relaxed);
+                if (each.outcome == head::Step::AtInnerStop) s.inner_knocks.fetch_add(1, std::memory_order_relaxed);
+            };
+            if (g_amiga_edges && i == 0) {
+                // The inputs at each select and each step, in the order the
+                // edges came within their kind: selects first (the motor
+                // latch), then steps.
+                uint32_t at;
+                while (amiga_pio::takeSelectSample(at))
+                    if (!host_off) drives[0]->onSelectEdge(now, at);
+                while (amiga_pio::takeStepSample(at))
+                    if (!host_off) stepped(drives[0]->onStepEdge(now, at));
+            }
+            stepped(drives[i]->onSample(now, pins, step_edge));
+            s.selected.store(drives[i]->selected(), std::memory_order_relaxed);
+
+            int request = s.disk_request.exchange(0, std::memory_order_relaxed);
+            if (request > 0) {
+                s.write_fault.store(false, std::memory_order_relaxed);  // a fresh start
+                drives[i]->insertDisk(write_protected[i]);
+            }
+            if (request < 0) drives[i]->ejectDisk();
+            if (request) s.disk_in.store(drives[i]->diskPresent(), std::memory_order_relaxed);
+
+            int swap = s.swap.load(std::memory_order_acquire);
+            drives[i]->setMailboxWhenEmpty(swap == SWAP_NONE);  // not while the cache refills
+            if (swap == SWAP_EJECT && !(i == active && write_gate.capturing())) {
+                drives[i]->ejectDisk();
+                s.disk_in.store(false, std::memory_order_relaxed);
+                s.swap.store(SWAP_EJECTED, std::memory_order_release);
+            } else if (swap == SWAP_INSERT) {
+                DiskTiming next = timingOf(s);
+                if (next != disk[i]) {  // another data rate, track length or speed
+                    disk[i] = next;
+                    drives[i]->setGeometry(next.period_us, next.last_cylinder);
+                    if (i == active) {
+                        data_rate = next.rate;
+                        rdata_pio::setFormat(next.words, data_rate);
+                        wdata_pio::setRate(data_rate);
+                    }
+                }
+                write_protected[i] = !s.writable.load();
+                s.write_fault.store(false, std::memory_order_relaxed);
+                drives[i]->insertDisk(write_protected[i]);
+                s.disk_in.store(true, std::memory_order_relaxed);
+                s.swap.store(SWAP_NONE, std::memory_order_release);
+            }
+
+            // After a lost write the disk reads as write-protected, so the
+            // host's next write fails where the user can see it.
+            if (s.write_fault.load(std::memory_order_relaxed) && drives[i]->diskPresent() &&
+                !drives[i]->writeProtected())
+                drives[i]->setWriteProtected(true);
+            s.write_protected.store(drives[i]->writeProtected(), std::memory_order_relaxed);
+        }
+        g_side.store(d0.side(), std::memory_order_relaxed);
+
+        activity::DriveEvent changes[activity::DriveObserver::MAX_EVENTS];
+        unsigned count = observer.observe(now, drives, n, e, changes);
+        for (unsigned i = 0; i < count; ++i)
+            if (!g_drive_events.push(changes[i])) g_drive_events_dropped.fetch_add(1, std::memory_order_relaxed);
+
+        // The cable's lines: each drive releases its own while deselected.
+        uint32_t levels = fdd::OUTPUT_MASK;
+        for (unsigned i = 0; i < n; ++i) levels &= drive::outputPins(drives[i]->outputs(now), g_interface, g_pin2_chng);
+        putOutputs(levels);  // with the gate, only the trace's view: the pins are the gate's
+        if (g_amiga_edges) amiga_pio::setLevels(drive::outputPins(d0.outputsSelected(now), g_interface, g_pin2_chng));
+
+        // The host selected the other drive: the streamer moves to its
+        // buffer, at the word under its head, and the capture to its rate.
+        // Not mid-write: the gate below ends the burst first (the old drive
+        // is deselected), and the switch follows on the next pass.
+        for (unsigned i = 0; i < n; ++i) {
+            if (i == active || !drives[i]->selected() || write_gate.capturing()) continue;
+            if (streaming) {
+                rdata_pio::enable(false);
+                streaming = false;
+                g_shared[active].streaming.store(false, std::memory_order_relaxed);
+            }
+            active = i;
+            data_rate = disk[i].rate;
+            rdata_pio::switchTo(g_cylinder_slots[i], disk[i].words, data_rate,
+                                wordUnderHead(*drives[i], now, data_rate));
+            wdata_pio::setRate(data_rate);
+            index_was = drives[i]->spindle().index(now);
+            break;
+        }
+        drive::Drive& d = *drives[active];
+
+        // The track starts at each index pulse, and RDATA only carries it
+        // while the host could be reading and the buffer holds the cylinder
+        // under the head (stale IDs would look like a seek error).
+        bool index = d.spindle().index(now);
+        if (index && !index_was) rdata_pio::restartAtIndex();
+        index_was = index;
+        bool stream = d.streams(now, g_loaders[active]->ready());
+        if (stream != streaming) {
+            rdata_pio::enable(stream);
+            streaming = stream;
+            g_shared[active].streaming.store(stream, std::memory_order_relaxed);
+        }
+
+        // Writes: run the capture from WGATE asserted to released, marking
+        // each burst's start and end in the stream for core 0 (write_burst.h).
+        // A burst needs room for both its marks.
+        bool room = g_capture_marks.size() + 2 <= 16;
+        switch (write_gate.onSample(now, pins, d, room, data_rate, burst)) {
+            case WriteGate::Action::Start:
+                burst.drive = uint8_t(active);
+                g_capture_marks.push(CaptureStream::Mark{true, wdata_pio::produced(), burst});
+                wdata_pio::start();
+                break;
+            case WriteGate::Action::Stop:
+                wdata_pio::stop();
+                g_capture_marks.push(CaptureStream::Mark{false, wdata_pio::produced(), WriteBurst{}});
+                break;
+            case WriteGate::Action::Missed:
+                g_bursts_dropped.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case WriteGate::Action::None:
+                break;
+        }
+        g_capture_produced.store(wdata_pio::produced(), std::memory_order_release);
+        g_shared[active].writing.store(write_gate.capturing(), std::memory_order_relaxed);
+    }
+}
+
+// The disks the firmware holds itself: the welcome disk (welcome_disk.h),
+// served without a card or an image; and the generated test disk
+// (gen_disk.h), which console `g` swaps in for the rig's slice 2 test.
+enum class Builtin : uint8_t { None, Welcome, Generated };
+
+// What answers SynthMinder's requests (duo_commands.h), below.
+static mailbox::Handler& mailboxHandler();
+
+// Core 0's share of each drive: its disk (the card's image, or a built-in
+// one, in PSRAM), the loader that keeps its cylinder buffer filled with the
+// cylinder under its head, its writer, and its swaps.
+struct DriveState {
+    ImageCache* cache = nullptr;  // in PSRAM: the slot holds this
+    DiskSlot* slot = nullptr;     // the disk in the drive
+    mailbox::MailboxSource* mailbox = nullptr;  // the slot, and SynthMinder's cylinder 82: the loader and writer use it
+    CylinderLoader* loader = nullptr;
+    BurstWriter* writer = nullptr;
+    bool from_card = false;             // serving an image from the card
+    Builtin builtin = Builtin::None;    // ...or this one
+    size_t image_index = 0;
+    // A swap under way.
+    uint32_t ejected_ms = 0;
+    bool filling = false;  // the new image is going into the cache
+    uint32_t fill_started_ms = 0;
+    Builtin swap_builtin = Builtin::None;  // what goes in: a built-in disk, or the card's image_index
+    size_t swap_from = 0;  // the image to go back to if the new one won't open
+    bool no_disk = false;  // neither would open (the card failed?): nothing to insert
+};
+static DriveState g_drv[bus::MAX_DRIVES];
+
+static GeneratedSource g_generated(ibm::HD_1440);
+static WelcomeSource g_welcome(welcome_text::FILES, welcome_text::FILE_COUNT, welcome_text::FAT_DATE);
+
+static TrackSource& builtinSource(Builtin b) {
+    return b == Builtin::Generated ? static_cast<TrackSource&>(g_generated) : static_cast<TrackSource&>(g_welcome);
+}
+static uint8_t g_track_data0[2][ibm::MAX_TRACK_DATA];
+static uint8_t (*g_track_data[bus::MAX_DRIVES])[ibm::MAX_TRACK_DATA] = {g_track_data0};
+static uint16_t g_track_scratch[ibm::MAX_TRACK_WORDS];  // used within one loader step: shared
+static uint32_t g_read_us_max = 0;    // slowest track read (console `s`): from the cache
+static uint32_t g_encode_us_max = 0;  // slowest track encode
+// Their totals and counts, for the means in `s` (console `z` zeroes all four
+// and the maxima).
+static uint64_t g_read_us_sum = 0, g_encode_us_sum = 0;
+static uint32_t g_reads = 0, g_encodes = 0;
+static uint32_t g_card_read_us_max = 0;  // slowest track read from the card, filling the cache
+static uint32_t g_fill_ms = 0;           // how long the last fill took
+
+// One step of filling a drive's cache: a track from the card.
+static bool fillStep(DriveState& s) {
+    uint32_t started = time_us_32();
+    bool more = s.cache->fill();
+    uint32_t took = time_us_32() - started;
+    if (more && took > g_card_read_us_max) g_card_read_us_max = took;
+    return more;
+}
+
+static void reportFill(DriveState& s, uint32_t started_ms) {
+    g_fill_ms = millis() - started_ms;
+    if (s.cache->fits())
+        Serial.printf("# cached %u/%u tracks in %lu ms\n", s.cache->cachedTracks(), s.cache->tracks(),
+                      (unsigned long)g_fill_ms);
+    else
+        Serial.println("# no PSRAM for the image cache: reading tracks from the card (slow seeks)");
+}
+
+// Decoding writes: a full track's data fields, plus room for strays; or a
+// flux image's cells, a track's worth. One burst at a time, so the drives'
+// writers share it.
+alignas(4) static uint8_t g_write_store[2 * ibm::MAX_TRACK_WORDS];
+// Two fields a sector for a whole track's write: up to 64 small sectors.
+constexpr size_t WRITE_FIELDS = 144;
+static mfm::Field g_write_fields[WRITE_FIELDS];
+static CaptureStream* g_capture = nullptr;
+static uint32_t g_sectors_written = 0;  // console `s`
+static uint32_t g_write_bad_crc = 0;
+static uint32_t g_write_unplaced = 0;
+static uint32_t g_write_us_max = 0;  // the longest chunk of decoding
+// Decoding's speed against the capture's: time and bytes in calls that fed
+// bytes without finishing a burst; the longest finish (decoding's tail plus
+// writing to the card); the longest gap between core 0's passes while a
+// burst was being captured (anything else core 0 does then).
+static uint64_t g_decode_us_sum = 0;
+static uint64_t g_decode_bytes = 0;
+static uint32_t g_finish_us_max = 0;
+static uint64_t g_finish_us_sum = 0;
+static uint32_t g_finishes = 0;
+static uint32_t g_burst_gap_us_max = 0;
+static uint32_t g_write_faults = 0;
+
+// The FDD Synth: a sample pack from the card, in RAM, played by the mixer.
+// The mixer hears every drive event even with no pack loaded (it's silent
+// then), so a pack loaded later knows the motor is running.
+static synth::Pack g_pack;
+static synth::Mixer g_mixer(g_pack);
+static bool g_pack_ok = false;  // a complete pack is loaded
+static size_t g_pack_index = 0;
+static int g_pack_request = -1;  // a pack chosen on the panel, loaded once the drive is idle
+
+static const char* packName() { return g_pack_ok ? sd_image::packs().name(g_pack_index) : ""; }
+
+// Loads pack `index` in place of the last; the mixer drops what was playing
+// (it pointed into the old pack) and carries on.
+static void loadPack(size_t index) {
+    g_pack_ok = sd_image::loadPack(g_pack, index, cfg::SAMPLE_POOL_MAX_BYTES);
+    g_pack_index = index;
+    g_mixer.reset();
+    if (!g_pack_ok) {
+        Serial.printf("# pack %s is incomplete or unreadable: no sound\n", sd_image::packs().name(index));
+        return;
+    }
+    if (audio::running())
+        audio::setRate(g_pack.rate);
+    else
+        audio::begin(g_mixer, g_pack.rate);
+    Serial.printf("# pack %s\n", packName());
+}
+
+// What the drive remembers across power-off (settings.h): read at power-on,
+// written a few seconds after a change once the drive is idle.
+static settings::Settings g_settings;  // as on the card
+static settings::Settings g_latest;    // as now
+static settings::SaveTimer g_save;
+static settings::Settings g_running;   // as at power-on: what the drive runs with
+static activity::Tracker g_activity;  // the sound events (serviceActivity)
+static bool g_card = false;
+
+// A drive's name for the panel and the console: "A", "B", "DS0"...
+static const char* driveName(unsigned drive) {
+    static const char* const PC[] = {"A", "B"};
+    static const char* const SHUGART[] = {"DS0", "DS1", "DS2"};
+    uint8_t unit = g_settings.bus.unit(drive);
+    return g_settings.bus.interface == bus::Interface::Shugart ? SHUGART[unit % 3] : PC[unit % 2];
+}
+
+// Tells core 1 what it needs of drive `i`'s disk: its timing, and whether
+// it's writable.
+static void publishDisk(unsigned i, const ibm::Format& fmt, bool writable) {
+    DriveShared& s = g_shared[i];
+    s.rate.store(fmt.dataRate());
+    s.words.store(fmt.track_bytes);
+    s.period_us.store(fmt.periodUs());
+    s.last_cylinder.store(fmt.lastPhysicalCylinder());
+    s.writable.store(writable);
+}
+
+// The SDK's: every dirty XIP cache line written out to PSRAM. Its header
+// (hardware/xip_cache.h) isn't on the Arduino core's include path, but the
+// function is in the core's SDK library.
+extern "C" void xip_cache_clean_all(void);
+
+// Drive `i`'s disk at power-on: the one the settings name (`device<i>`),
+// else the one that was in (`last<i>`), else the card's i-th (so two drives start
+// with different disks), else the welcome disk.
+static void chooseDisk(unsigned i) {
+    DriveState& s = g_drv[i];
+    // PSRAM, if the board has it (the BB48R does): pmalloc fails without.
+    // Used through the uncached alias: PSRAM shares the XIP cache with the
+    // flash core 1 runs from, and copying a 9 KB track through it would
+    // evict core 1's loop, stalling it on misses long enough to miss a
+    // short STEP pulse. Uncached, core 1's code stays put.
+    //
+    // But pmalloc keeps its bookkeeping next to the block, written through
+    // the cache. A cache line holding that and the image's first bytes was
+    // written back after the image was copied in, putting back what PSRAM
+    // held before: 4 wrong bytes at the start of an ADF, seen on the rig
+    // (2026-11-05). So the image keeps clear of the allocator's lines (it
+    // starts 64 to 127 bytes in, on a 64-byte boundary, with 64 to spare
+    // after), and the cache writes the bookkeeping out now, before the copy.
+    const size_t bytes = g_drive_count > 1 ? cfg::IMAGE_CACHE_BYTES_EACH : cfg::IMAGE_CACHE_BYTES;
+    constexpr size_t GUARD = 64;
+    uint8_t* block = static_cast<uint8_t*>(pmalloc(bytes + 3 * GUARD));
+    uint8_t* ram = nullptr;
+    if (block) {
+        xip_cache_clean_all();
+        uintptr_t at = (uintptr_t(block) + 2 * GUARD - 1) & ~uintptr_t(GUARD - 1);
+        ram = reinterpret_cast<uint8_t*>(at) + (XIP_NOCACHE_NOALLOC_BASE - XIP_BASE);
+    }
+    s.cache = new ImageCache(ram, ram ? bytes : 0);
+    const ImageList& images = sd_image::images();
+    size_t index = images.count();
+    if (g_settings.image[i][0]) {
+        index = images.find(g_settings.image[i]);
+        if (index >= images.count())
+            Serial.printf("# %s, the settings' device%u, isn't on the card\n", g_settings.image[i], i);
+    }
+    if (index >= images.count()) index = images.find(g_settings.last[i]);
+    if (g_card && index >= images.count()) index = images.count() ? i % images.count() : 0;
+    TrackSource* image = g_card ? sd_image::open(index, i) : nullptr;
+    if (!image && index) image = sd_image::open(index = 0, i);
+    s.image_index = index;
+    s.from_card = image != nullptr;
+    if (!image) {
+        // The welcome disk. Writes to it stay in PSRAM until a restart; with
+        // no PSRAM to keep them, it's read-only.
+        s.builtin = Builtin::Welcome;
+        image = &g_welcome;
+        Serial.println(g_card ? "# no disk image on the card: serving the welcome disk"
+                              : "# no microSD card: serving the welcome disk");
+    }
+    // All of it into PSRAM before the drive starts: about 0.6 s from the card.
+    uint32_t started = millis();
+    s.cache->attach(*image);
+    g_welcome.keepsWrites(s.cache->fits());
+    while (fillStep(s)) {}
+    reportFill(s, started);
+    s.slot = new DiskSlot(*s.cache);
+    s.mailbox = new mailbox::MailboxSource(*s.slot, i);
+    s.loader = new CylinderLoader(*s.mailbox, g_cylinder_slots[i], g_track_scratch, g_track_data[i][0], g_track_data[i][1]);
+    s.loader->setStreamPosition(&g_dma_position);
+    s.mailbox->setLoader(s.loader);
+    s.mailbox->setHandler(&mailboxHandler());
+    s.writer = new BurstWriter(*s.mailbox, *s.loader, g_write_store, sizeof g_write_store, g_write_fields, WRITE_FIELDS);
+    s.writer->between_writes = audio::service;  // a track's card writes outlast the audio queue
+    while (s.loader->service() != CylinderLoader::Step::Idle) audio::service();  // cylinder 0, before the host can ask
+    g_loaders[i] = s.loader;
+    publishDisk(i, s.slot->format(), s.slot->writable());
+}
+
+static void chooseDisks() {
+    sd_image::setBetweenReads(audio::service);  // an HFE cylinder's load outlasts the audio queue
+    bool card = sd_image::mount();
+    g_card = card;
+    if (card) {
+        static char text[settings::FILE_MAX];  // off core 0's stack
+        g_settings = settings::parse(text, sd_image::readSettings(text, sizeof text));
+        g_latest = g_settings;
+    }
+    const bus::Setup& bus = g_settings.bus;
+    g_drive_count = bus.drives();
+    // A second drive's buffers, before the sample pack takes its share of RAM.
+    if (g_drive_count > 1) {
+        g_cylinder_slots[1] = static_cast<uint32_t*>(std::malloc(sizeof g_slots0));
+        g_track_data[1] = static_cast<uint8_t(*)[ibm::MAX_TRACK_DATA]>(std::malloc(sizeof g_track_data0));
+        if (!g_cylinder_slots[1] || !g_track_data[1]) {
+            Serial.println("# no RAM for a second drive: one drive only");
+            g_drive_count = 1;
+        }
+    }
+    if (card) {
+        const PackList& packs = sd_image::packs();
+        if (packs.count()) {
+            size_t pack = packs.find(g_settings.pack);
+            loadPack(pack < packs.count() ? pack : 0);
+        }
+    }
+    g_interface = bus.interface;
+    g_pin2_chng = bus.pin2_chng;
+    g_running = g_settings;
+    // The trip back from SynthMinder's mailbox is silent (activity.h).
+    g_activity.setQuietCylinder(bus.interface == bus::Interface::IbmPc ? mailbox::CYLINDER : -1);
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        g_drive_config[i].lines = bus::lines(bus, i);
+        g_drive_config[i].interface = bus.interface;
+        // SynthMinder's mailbox: a PC's (mailbox.h).
+        g_drive_config[i].mailbox_cylinder = bus.interface == bus::Interface::IbmPc ? mailbox::CYLINDER : 0;
+        chooseDisk(i);
+    }
+    static CaptureStream stream(g_capture_ring, cfg::CAPTURE_RING_BYTES, *g_drv[0].writer);
+    for (unsigned i = 1; i < g_drive_count; ++i) stream.setWriter(uint8_t(i), *g_drv[i].writer);
+    stream.ticks_per_cell = wdata_pio::ticksPerCell();
+    stream.edge_ticks = wdata_pio::edgeTicks();
+    g_capture = &stream;
+    g_started.store(true, std::memory_order_release);
+}
+
+// The disk is out for at least this long during a swap, as when a person
+// changes disks: the host sees DSKCHG, and the synth plays EJECT then
+// INSERT. Longer if filling the cache takes longer (about 0.6 s).
+constexpr uint32_t SWAP_EJECTED_MS = 500;
+
+// The drive the console's `[`, `]`, `d` and `i` act on: `1` or `2` picks it.
+static unsigned g_console_drive = 0;
+
+// From the panel's disk list, or console `[` / `]`: image `index` on the
+// card; or, console `g`, a built-in disk.
+static void startSwap(unsigned drive, size_t index, Builtin builtin = Builtin::None) {
+    DriveState& s = g_drv[drive];
+    if (g_shared[drive].swap.load() != SWAP_NONE) {
+        Serial.println("# a swap is already under way");
+        return;
+    }
+    s.swap_from = s.image_index;
+    s.image_index = index;
+    s.swap_builtin = builtin;
+    Serial.printf("# swapping %s to %s\n", driveName(drive),
+                  builtin == Builtin::Generated ? "the generated disk"
+                  : builtin == Builtin::Welcome ? "the welcome disk"
+                                                : sd_image::images().name(index));
+    s.ejected_ms = 0;
+    s.filling = false;
+    g_shared[drive].swap.store(SWAP_EJECT, std::memory_order_release);
+}
+
+static void requestSwap(bool next) {
+    const ImageList& images = sd_image::images();
+    DriveState& s = g_drv[g_console_drive];
+    if (!images.count() || (s.from_card && images.count() < 2)) {
+        Serial.println("# no other image on the card");
+        return;
+    }
+    // From a built-in disk, back to the image that was in.
+    size_t index = !s.from_card ? s.image_index : next ? images.next(s.image_index) : images.prev(s.image_index);
+    startSwap(g_console_drive, index);
+}
+
+// Console `g`: the generated disk, for the rig's slice 2 test; `g` again
+// puts back the card's image, or the welcome disk.
+static void toggleGenerated() {
+    DriveState& s = g_drv[g_console_drive];
+    if (s.builtin != Builtin::Generated)
+        startSwap(g_console_drive, s.image_index, Builtin::Generated);
+    else
+        startSwap(g_console_drive, s.image_index, sd_image::images().count() ? Builtin::None : Builtin::Welcome);
+}
+
+// From the panel's long action, or console `d` (the rig's way to set DSKCHG).
+static void toggleDisk(unsigned drive) {
+    DriveShared& sh = g_shared[drive];
+    if (sh.swap.load() != SWAP_NONE) {  // the swap ejects and inserts
+        Serial.println("# a swap is under way");
+        return;
+    }
+    bool insert = !sh.disk_in.load();
+    if (insert && g_drv[drive].no_disk) {
+        Serial.println("# no disk to insert: the last swap couldn't open an image");
+        return;
+    }
+    sh.disk_request.store(insert ? 1 : -1);
+    Serial.printf("# disk %s\n", insert ? "inserted" : "ejected");
+}
+
+// The swap's last step: the cached image in the slot, the cylinder under the
+// head loaded, and core 1 told to insert it.
+static void insertCached(unsigned drive) {
+    DriveState& s = g_drv[drive];
+    DriveShared& sh = g_shared[drive];
+    s.slot->insert(*s.cache);
+    s.loader->reset();
+    s.loader->request(sh.cylinder.load(std::memory_order_relaxed));
+    // The audio between the steps: an HFE head takes about 27 ms, so a
+    // cylinder's two would outlast a 46 ms queue.
+    while (s.loader->service() != CylinderLoader::Step::Idle) audio::service();
+    publishDisk(drive, s.cache->format(), s.cache->writable());
+    sh.swap.store(SWAP_INSERT, std::memory_order_release);
+}
+
+static void serviceSwap(unsigned drive) {
+    DriveState& s = g_drv[drive];
+    DriveShared& sh = g_shared[drive];
+    if (sh.swap.load(std::memory_order_acquire) != SWAP_EJECTED) return;
+    if (!s.ejected_ms) s.ejected_ms = millis() | 1;
+    // Filling the cache with the new image: a track per call, so the rest of
+    // core 0 (audio, the panel) carries on. Then the disk goes in, once it
+    // has been out for SWAP_EJECTED_MS.
+    if (s.filling) {
+        if (fillStep(s)) return;
+        if (millis() - s.ejected_ms < SWAP_EJECTED_MS) return;
+        s.filling = false;
+        reportFill(s, s.fill_started_ms);
+        insertCached(drive);
+        return;
+    }
+    // Wait for any write burst still being decoded: it may belong to the old
+    // disk, and opening the new image closes the old one.
+    if (g_capture->inBurst() || g_capture_marks.size()) return;
+    const ImageList& images = sd_image::images();
+    TrackSource* image =
+        s.swap_builtin != Builtin::None ? &builtinSource(s.swap_builtin) : sd_image::open(s.image_index, drive);
+    s.builtin = s.swap_builtin;
+    s.from_card = s.builtin == Builtin::None;
+    if (!image) {
+        // Opening it closed the old image, so the slot can't keep that one:
+        // put the old disk back in, freshly opened, as if the swap was undone.
+        Serial.printf("# can't open %s; putting %s back\n", images.name(s.image_index), images.name(s.swap_from));
+        s.image_index = s.swap_from;
+        image = sd_image::open(s.image_index, drive);
+    }
+    if (!image) {
+        Serial.println("# can't open that either; the drive stays empty");
+        s.slot->insert(g_generated);  // never the closed file
+        s.loader->reset();            // nor its cylinder: ready() is -1, so RDATA stays off
+        s.no_disk = true;
+        sh.swap.store(SWAP_NONE, std::memory_order_release);
+        return;
+    }
+    s.no_disk = false;
+    // The cache is free to refill: the disk is out (nothing reads it for the
+    // host) and no write is pending. The loader resets once it's in.
+    s.cache->attach(*image);
+    s.filling = true;
+    s.fill_started_ms = millis();
+}
+
+// Decodes what the capture has brought, up to a chunk per call, so audio
+// and the rest of core 0 get a turn between chunks.
+constexpr size_t WRITE_CHUNK_BYTES = 2048;
+
+static void serviceWrites() {
+    static uint32_t last_pass = 0;
+    uint32_t started = time_us_32();
+    if (g_capture->inBurst() && last_pass && started - last_pass > g_burst_gap_us_max)
+        g_burst_gap_us_max = started - last_pass;
+    last_pass = started;
+    uint32_t before = g_capture->consumed();
+    BurstResult r;
+    auto next_mark = [](CaptureStream::Mark& m) { return g_capture_marks.pop(m); };
+    bool finished = g_capture->service(g_capture_produced.load(std::memory_order_acquire), WRITE_CHUNK_BYTES, next_mark, r);
+    if (!finished && g_capture->inBurst() && g_capture->consumed() != before) {
+        g_decode_us_sum += time_us_32() - started;
+        g_decode_bytes += g_capture->consumed() - before;
+    }
+    if (finished && !r.overrun && r.persisted) {
+        uint32_t took = time_us_32() - started;
+        if (took > g_finish_us_max) g_finish_us_max = took;
+        g_finish_us_sum += took;
+        ++g_finishes;
+    }
+    if (finished) {
+        g_sectors_written += r.persisted;
+        g_write_bad_crc += r.decoded.bad_crc;
+        g_write_unplaced += r.decoded.unplaced;
+        if (lostWrite(r)) {
+            unsigned drive = g_capture->burstDrive();
+            ++g_write_faults;
+            g_shared[drive].write_fault.store(true, std::memory_order_relaxed);
+            Serial.printf("# WRITE FAULT on %s: %s; write-protected until the disk is inserted again\n",
+                          driveName(drive), r.overrun ? "the capture overran" : "the card refused a sector");
+        }
+    }
+    uint32_t took = time_us_32() - started;
+    if (took > g_write_us_max) g_write_us_max = took;
+}
+
+// A step for each drive's loader that has one. Only a selected drive's head
+// moves, so at most one is loading.
+static void serviceLoaders() {
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        CylinderLoader& loader = *g_drv[i].loader;
+        loader.request(g_shared[i].cylinder.load(std::memory_order_relaxed));
+        uint32_t started = time_us_32();
+        CylinderLoader::Step step = loader.service();
+        uint32_t took = time_us_32() - started;
+        if (step == CylinderLoader::Step::ReadHead0 || step == CylinderLoader::Step::ReadHead1) {
+            if (took > g_read_us_max) g_read_us_max = took;
+            g_read_us_sum += took;
+            ++g_reads;
+        } else if (step != CylinderLoader::Step::Idle) {
+            if (took > g_encode_us_max) g_encode_us_max = took;
+            g_encode_us_sum += took;
+            ++g_encodes;
+        }
+    }
+}
+
+// Console `z`: the loader's timings start again, so a test can measure one
+// phase on its own (the maxima since power-on include the first loads).
+static void zeroTimings() {
+    audio::zeroGap();
+    g_read_us_max = g_encode_us_max = 0;
+    g_read_us_sum = g_encode_us_sum = 0;
+    g_reads = g_encodes = 0;
+    g_decode_us_sum = g_decode_bytes = 0;
+    g_finish_us_max = g_burst_gap_us_max = 0;
+    g_finish_us_sum = g_finishes = 0;
+    g_write_us_max = 0;
+    Serial.println("# timings zeroed");
+}
+
+// Console `t`: what a loader step costs, in its parts, on the drive's disk:
+// reading a track from its source, building it (ibm::buildTrack), and
+// interleaving it into a cylinder buffer (rdata::setHead, into a spare one,
+// so the live buffer is untouched). Each part BENCH_RUNS times; min, mean and
+// max in microseconds. Core 1 keeps running, as it does for a real load.
+// Only while the drive isn't loading: it uses the loader's scratch buffer.
+constexpr unsigned BENCH_RUNS = 8;
+
+struct BenchTimes {
+    uint32_t min = UINT32_MAX, max = 0;
+    uint64_t sum = 0;
+    void add(uint32_t us) {
+        if (us < min) min = us;
+        if (us > max) max = us;
+        sum += us;
+    }
+};
+
+static void printBench(const char* name, const BenchTimes& t) {
+    Serial.printf(" %s=%lu/%lu/%lu", name, (unsigned long)t.min, (unsigned long)(t.sum / BENCH_RUNS),
+                  (unsigned long)t.max);
+}
+
+static void benchLoader(unsigned drive) {
+    DriveState& s = g_drv[drive];
+    if (s.loader->loading()) {
+        Serial.println("# bench: the drive is loading a cylinder; try again when it's idle");
+        return;
+    }
+    const ibm::Format& fmt = s.slot->format();
+    if (fmt.encoding == ibm::ENCODING_RAW) {
+        Serial.println("# bench: a flux image has no encode step");
+        return;
+    }
+    uint8_t* data = static_cast<uint8_t*>(std::malloc(ibm::MAX_TRACK_DATA));
+    uint32_t* slots = static_cast<uint32_t*>(std::malloc(sizeof(uint32_t) * fmt.track_bytes));
+    if (!data || !slots) {
+        std::free(data);
+        std::free(slots);
+        Serial.println("# bench: no RAM for the buffers");
+        return;
+    }
+    const uint8_t cyl = 40, head = 1;  // a track from the middle of the disk
+    BenchTimes read, build, interleave;
+    bool ok = true;
+    for (unsigned i = 0; i < BENCH_RUNS; ++i) {
+        uint32_t t0 = time_us_32();
+        ok &= s.slot->readTrack(cyl, head, data);
+        uint32_t t1 = time_us_32();
+        ok &= ibm::buildTrack(fmt, cyl, head, data, g_track_scratch);
+        uint32_t t2 = time_us_32();
+        rdata::setHead(head, g_track_scratch, fmt.track_bytes, slots);
+        uint32_t t3 = time_us_32();
+        read.add(t1 - t0);
+        build.add(t2 - t1);
+        interleave.add(t3 - t2);
+        audio::service();  // a part at a time, as the loader goes
+    }
+    std::free(data);
+    std::free(slots);
+    Serial.printf("BENCH c=%u:h=%u words=%u ok=%d", cyl, head, (unsigned)fmt.track_bytes, (int)ok);
+    printBench("read_us", read);
+    printBench("build_us", build);
+    printBench("interleave_us", interleave);
+    Serial.print("\n");
+}
+
+// A flux image's weak bits: new noise several times a revolution, as a real
+// drive reads differently each time. Cheap where there are none.
+static void serviceWeakBits() {
+    static uint32_t last_ms = 0;
+    uint32_t now = millis();
+    if (now - last_ms < 50) return;
+    last_ms = now;
+    for (unsigned i = 0; i < g_drive_count; ++i) g_drv[i].loader->refreshWeak();
+}
+
+static bool loading() {
+    for (unsigned i = 0; i < g_drive_count; ++i)
+        if (g_drv[i].loader->loading()) return true;
+    return false;
+}
+
+// The sounds: drive events in, ACT lines out. A line that can't be printed
+// yet waits, and the tracker's queue holds the rest.
+static uint32_t g_activity_checked_us = 0;
+
+static bool printLine(const char* line, size_t n);
+
+static void serviceActivity() {
+    activity::DriveEvent in;
+    while (g_drive_events.pop(in)) g_activity.onDriveEvent(in);
+    uint32_t now = time_us_32();
+    if (now - g_activity_checked_us >= 1000) {
+        g_activity_checked_us = now;
+        g_activity.update(now);
+    }
+    // Every event to the mixer at once; the ACT line follows when the serial
+    // link can take it, so a slow host delays the trace, never the sound.
+    static SpscRing<activity::Event, 64> unprinted;
+    activity::Event e;
+    while (g_activity.pop(e)) {
+        g_mixer.event(e);
+        unprinted.push(e);  // dropped if the trace can't keep up; the sound isn't
+    }
+    static activity::Event pending;
+    static bool has_pending = false;
+    for (int i = 0; i < 8; ++i) {
+        if (!has_pending && !unprinted.pop(pending)) return;
+        char line[48];
+        size_t len = activity::format(pending, line, sizeof line);
+        has_pending = !printLine(line, len);
+        if (has_pending) return;
+    }
+}
+
+static unsigned imageKb(unsigned drive) {
+    return g_drv[drive].slot ? unsigned(g_drv[drive].slot->format().imageBytes() / 1024) : 0;
+}
+
+static void printImage(unsigned drive) {
+    unsigned kb = imageKb(drive);
+    const char* prefix = g_drive_count > 1 ? driveName(drive) : "";
+    const char* gap = g_drive_count > 1 ? " " : "";
+    if (!g_drv[drive].from_card)  // "IMAGE welcome 1440", "IMAGE generated 1440"
+        Serial.printf("IMAGE %s%s%s %u\n", prefix, gap,
+                      g_drv[drive].builtin == Builtin::Generated ? "generated" : "welcome", kb);
+    else
+        Serial.printf("IMAGE %s%s%s %u contiguous=%d writable=%d index=%u/%u\n", prefix, gap, sd_image::name(drive),
+                      kb, (int)sd_image::contiguous(drive), (int)g_shared[drive].writable.load(),
+                      unsigned(g_drv[drive].image_index + 1), unsigned(sd_image::images().count()));
+}
+
+// The front panel: the drive it shows as it is now in, swaps, ejects and
+// the volume out.
+static ui::Status panelStatus() {
+    unsigned i = panel::model().drive() < g_drive_count ? panel::model().drive() : 0;
+    const DriveState& d = g_drv[i];
+    const DriveShared& sh = g_shared[i];
+    ui::Status s;
+    s.drives = uint8_t(g_drive_count);
+    s.drive_name = driveName(i);
+    s.images = d.from_card ? &sd_image::images() : nullptr;
+    s.image = d.image_index;
+    s.image_name = d.from_card                         ? sd_image::name(i)
+                   : d.builtin == Builtin::Generated ? "Generated disk"
+                                                     : "Welcome disk";
+    s.kb = imageKb(i);
+    s.flux = d.slot && d.slot->format().encoding == ibm::ENCODING_RAW;
+    s.disk_in = sh.disk_in.load(std::memory_order_relaxed);
+    s.write_protected = sh.write_protected.load(std::memory_order_relaxed);
+    s.swapping = sh.swap.load(std::memory_order_relaxed) != SWAP_NONE;
+    s.motor = g_activity.motorOn();
+    s.cylinder = sh.cylinder.load(std::memory_order_relaxed);
+    s.head = g_side.load(std::memory_order_relaxed);
+    s.activity = sh.writing.load(std::memory_order_relaxed)                               ? ui::Activity::Write
+                 : g_activity.seeking() && sh.selected.load(std::memory_order_relaxed) ? ui::Activity::Seek
+                 : sh.streaming.load(std::memory_order_relaxed)                           ? ui::Activity::Read
+                                                                                           : ui::Activity::Idle;
+    // The spinning icon: 300 RPM while the motor runs, still otherwise.
+    static uint8_t rotation = 0;
+    if (s.motor) rotation = uint8_t((time_us_32() % 200000) * 256 / 200000);
+    s.rotation = rotation;
+    if (g_pack_ok) {
+        s.pack = packName();
+        s.sounds_loaded = g_pack.loadedMask();
+        s.rate = g_pack.rate;
+        s.pack_kb = g_pack.bytes() / 1024;
+    }
+    s.packs = g_card ? &sd_image::packs() : nullptr;
+    s.pack_index = g_pack_index;
+    s.pack_loading = g_pack_request >= 0;
+    for (unsigned k = 0; k < g_drive_count; ++k) s.loads += g_drv[k].loader->loads();
+    s.written = g_sectors_written;
+    s.bad_crc = g_write_bad_crc;
+    s.overruns = g_capture->overruns();
+    s.underruns = audio::underruns();
+    return s;
+}
+
+static void servicePanel() {
+    panel::service(panelStatus(), millis(), !loading());  // never mid-load
+    ui::Model& m = panel::model();
+    size_t image;
+    uint8_t drive;
+    // Taken only when no swap is running, so a choice made during one (a
+    // console swap) waits for it instead of being refused.
+    bool idle = true;
+    for (unsigned i = 0; i < g_drive_count; ++i) idle = idle && g_shared[i].swap.load() == SWAP_NONE;
+    if (idle && m.takeSwap(image, drive) && drive < g_drive_count) startSwap(drive, image);
+    if (m.takeEjectToggle(drive) && drive < g_drive_count) toggleDisk(drive);
+    size_t pack;
+    if (m.takePackChange(pack)) g_pack_request = int(pack);
+    g_mixer.setVolume(m.volume());
+}
+
+// Nothing the host is doing could be held up: it has deselected the drives,
+// and no swap or write is under way. Slow card work (a pack, the settings)
+// waits for this.
+static bool driveIdle() {
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        const DriveShared& sh = g_shared[i];
+        if (sh.selected.load(std::memory_order_relaxed) || sh.swap.load() != SWAP_NONE ||
+            sh.writing.load(std::memory_order_relaxed))
+            return false;
+    }
+    return !g_capture->inBurst() && !g_capture_marks.size();
+}
+
+static void servicePack() {
+    if (g_pack_request < 0 || !driveIdle()) return;
+    size_t pack = size_t(g_pack_request);
+    g_pack_request = -1;
+    loadPack(pack);
+}
+
+static void serviceSettings() {
+    if (!g_card) return;
+    settings::Settings now;
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        // A built-in disk isn't remembered: the card's image comes back.
+        // `device<i>` is the user's: kept as it is.
+        std::strncpy(now.image[i], g_settings.image[i], settings::NAME - 1);
+        if (g_drv[i].from_card && !g_drv[i].no_disk)
+            std::strncpy(now.last[i], sd_image::name(i), settings::NAME - 1);
+        else
+            std::strncpy(now.last[i], g_settings.last[i], settings::NAME - 1);
+    }
+    if (sd_image::packs().count()) std::strncpy(now.pack, sd_image::packs().name(g_pack_index), settings::NAME - 1);
+    now.volume = panel::model().volume();
+    now.bus = g_settings.bus;  // only an edit of the file changes it
+    uint32_t ms = millis();
+    if (now != g_latest) {
+        g_latest = now;
+        g_save.changed(ms);
+    }
+    if (!g_save.due(ms, driveIdle())) return;
+    g_save.saved();
+    if (g_latest == g_settings) return;  // changed back again
+    static char text[settings::FILE_MAX];  // off core 0's stack
+    if (sd_image::writeSettings(text, settings::format(g_latest, text, sizeof text)))
+        g_settings = g_latest;
+    else
+        Serial.println("# couldn't save the settings to the card");
+}
+
+// ---- SynthMinder's mailbox ----------------------------------------------------------
+//
+// The drive as SynthMinder sees it (duo_commands.h), over core 0's state.
+// Requests arrive in the middle of a write burst's finish (mailbox.h), with
+// the host still using the drive, so nothing here waits or touches the card:
+// a swap of the drive the request came through waits until the head leaves
+// the mailbox (the PC reads the reply first), a pack loads and the settings
+// file is written once the drive is idle, as the front panel's are.
+
+// A swap or eject of the drive the request came through, waiting.
+struct MailboxSwap {
+    bool waiting = false;
+    bool eject = false;
+    unsigned drive = 0;
+    size_t image = 0;
+    uint32_t asked_ms = 0;
+};
+static MailboxSwap g_mailbox_swap;
+// The longest it waits for the head to leave: SynthMinder steps away at once.
+constexpr uint32_t MAILBOX_SWAP_WAIT_MS = 1500;
+// A SET's new file, written once the drive is idle.
+static settings::Settings g_mailbox_settings;
+static bool g_mailbox_settings_due = false;
+
+// A setting's value in FDDSYNTH.CFG's words: `key=` in settings::format's text.
+static void settingText(const settings::Settings& s, const char* key, char* out, size_t cap) {
+    static char text[settings::FILE_MAX];  // off core 0's stack
+    size_t n = settings::format(s, text, sizeof text);
+    out[0] = 0;
+    size_t k = std::strlen(key);
+    for (size_t at = 0; at < n;) {
+        size_t end = at;
+        while (end < n && text[end] != '\n') ++end;
+        if (end - at > k && std::memcmp(text + at, key, k) == 0 && text[at + k] == '=') {
+            size_t v = end - at - k - 1;
+            if (v >= cap) v = cap - 1;
+            std::memcpy(out, text + at + k + 1, v);
+            out[v] = 0;
+            return;
+        }
+        at = end + 1;
+    }
+}
+
+class FirmwareDuo final : public duo::Duo {
+public:
+    const char* firmware() const override { return FIRMWARE_VERSION; }
+    unsigned drives() const override { return g_drive_count; }
+    void driveInfo(unsigned i, duo::DriveInfo& out) const override {
+        out = duo::DriveInfo{};
+        const DriveState& s = g_drv[i];
+        const DriveShared& sh = g_shared[i];
+        out.letter = driveName(i)[0];
+        out.disk_in = sh.disk_in.load() && !s.no_disk;
+        out.disk = s.builtin == Builtin::Welcome     ? "welcome"
+                   : s.builtin == Builtin::Generated ? "generated"
+                                                     : sd_image::name(i);
+        const ibm::Format& fmt = s.slot->format();
+        duo::describe(fmt, out.format, sizeof out.format);
+        out.kb = s.from_card ? sd_image::images().size(s.image_index) / 1024 : fmt.imageBytes() / 1024;
+        out.cylinder = sh.cylinder.load();
+        out.motor = g_activity.motorOn() && sh.selected.load();
+        out.write_protected = sh.write_protected.load();
+    }
+    int volume() const override { return panel::model().volume(); }
+    size_t packCount() const override { return g_card ? sd_image::packs().count() : 0; }
+    size_t packIndex() const override { return g_pack_request >= 0 ? size_t(g_pack_request) : g_pack_index; }
+    const char* packName(size_t i) const override { return sd_image::packs().name(i); }
+    size_t imageCount() const override { return g_card ? sd_image::images().count() : 0; }
+    const char* imageName(size_t i) const override { return sd_image::images().name(i); }
+    uint32_t imageKB(size_t i) const override { return sd_image::images().size(i) / 1024; }
+
+    size_t settingCount() const override { return COUNT; }
+    duo::Setting setting(size_t i) const override {
+        const settings::Settings& next = g_mailbox_settings_due ? g_mailbox_settings : g_latest;
+        settingText(next, KEYS[i], next_[i], sizeof next_[i]);
+        settingText(g_running, KEYS[i], now_[i], sizeof now_[i]);
+        return {KEYS[i], next_[i], now_[i]};
+    }
+
+    const char* insert(unsigned drive, size_t image, unsigned asked_on) override {
+        if (busy(drive)) return "busy";
+        if (drive == asked_on) return wait(drive, false, image);
+        startSwap(drive, image);
+        return nullptr;
+    }
+    const char* eject(unsigned drive, unsigned asked_on) override {
+        if (busy(drive)) return "busy";
+        if (!g_shared[drive].disk_in.load()) return "empty";
+        if (drive == asked_on) return wait(drive, true, 0);
+        g_shared[drive].disk_request.store(-1);
+        return nullptr;
+    }
+    const char* setPack(size_t index) override {
+        g_pack_request = int(index);  // servicePack loads it once the drive is idle
+        return nullptr;
+    }
+    const char* setVolume(int volume) override {
+        panel::model().setVolume(volume);  // servicePanel gives the mixer it; serviceSettings saves it
+        return nullptr;
+    }
+    const char* set(const char* key, const char* value) override {
+        if (!g_card) return "card";
+        bool allowed = false;
+        for (size_t i = 0; i < COUNT; ++i) allowed = allowed || std::strcmp(key, KEYS[i]) == 0;
+        if (!allowed) return "key";
+        // `-` clears a start disk: back to the last one in.
+        char line[settings::NAME + 32];
+        int n = std::snprintf(line, sizeof line, "%s=%s", key, std::strcmp(value, "-") == 0 ? "" : value);
+        settings::Settings next = g_mailbox_settings_due ? g_mailbox_settings : g_latest;
+        if (n <= 0 || size_t(n) >= sizeof line || !settings::set(next, line, size_t(n))) return "value";
+        g_mailbox_settings = next;
+        g_mailbox_settings_due = true;
+        return nullptr;
+    }
+
+private:
+    // Only these: `interface` or `cable` set wrong from the PC would lose it the drive at the next power-on.
+    static constexpr size_t COUNT = 3;
+    static constexpr const char* KEYS[COUNT] = {"drive", "device0", "device1"};
+    mutable char next_[COUNT][settings::NAME];
+    mutable char now_[COUNT][settings::NAME];
+
+    static bool busy(unsigned drive) {
+        return g_shared[drive].swap.load() != SWAP_NONE || (g_mailbox_swap.waiting && g_mailbox_swap.drive == drive);
+    }
+    static const char* wait(unsigned drive, bool eject, size_t image) {
+        g_mailbox_swap = MailboxSwap{true, eject, drive, image, millis()};
+        return nullptr;
+    }
+};
+
+static FirmwareDuo g_duo;
+static duo::MailboxHandler g_mailbox_handler(g_duo);
+static mailbox::Handler& mailboxHandler() { return g_mailbox_handler; }
+
+static void serviceMailbox() {
+    MailboxSwap& w = g_mailbox_swap;
+    if (w.waiting) {
+        bool left = g_shared[w.drive].cylinder.load() != mailbox::CYLINDER;
+        if (left || millis() - w.asked_ms > MAILBOX_SWAP_WAIT_MS) {
+            w.waiting = false;
+            if (w.eject)
+                g_shared[w.drive].disk_request.store(-1);
+            else
+                startSwap(w.drive, w.image);
+        }
+    }
+    if (g_mailbox_settings_due && driveIdle()) {
+        g_mailbox_settings_due = false;
+        static char text[settings::FILE_MAX];  // off core 0's stack
+        if (sd_image::writeSettings(text, settings::format(g_mailbox_settings, text, sizeof text))) {
+            g_settings = g_latest = g_mailbox_settings;
+            Serial.println("# SynthMinder changed the settings: they apply from the next power-on");
+        } else {
+            Serial.println("# couldn't save SynthMinder's settings to the card");
+        }
+    }
+}
+#endif
+
+// ---- Core 0 ---------------------------------------------------------------------
+
+static TraceCoalescer g_coalescer;
+static uint32_t g_last_event_ms = 0;
+static uint32_t g_reported_drops = 0;
+
+// Prints a line only if USB serial can take it now; lines that can't be
+// printed wait in the trace ring (and are counted as dropped if it fills).
+static bool printLine(const char* line, size_t n) {
+    if (Serial && Serial.availableForWrite() < int(n)) return false;
+    Serial.write(line, n);
+    return true;
+}
+
+static void printReady() {
+    // "direct": the outputs are wired straight to the header (config.h).
+    Serial.printf("READY FDDSynthDuo %s slice%d%s\n", FIRMWARE_VERSION, FIRMWARE_SLICE,
+                  cfg::OUTPUTS_OPEN_DRAIN ? " direct" : "");
+}
+
+// Current level of every input line: a wiring check. With the host connected
+// and idle, every line should be OFF (high, on its pull-up).
+static void printPins() {
+    char line[160];
+    size_t n = formatPins(pinsAsSample(), line, sizeof line);
+    Serial.write(line, n);
+}
+
+static void printStats() {
+    Serial.printf("STATS events=%lu dropped=%lu steps=%lu ring=%u", (unsigned long)g_events.load(),
+                  (unsigned long)g_dropped.load(), (unsigned long)g_steps.load(), (unsigned)g_trace.size());
+#if FIRMWARE_SLICE != 0
+    char units[12];
+    Serial.printf(" core1=%d core0_stack=%lu", g_core1_stage.load(), (unsigned long)core0StackUsed());
+    Serial.printf(" interface=%s cable=%s drive=%s", bus::interfaceName(g_settings.bus.interface),
+                  bus::cableName(g_settings.bus.cable), bus::unitsName(g_settings.bus, units));
+    // Each drive's: unsuffixed for the first, "2" after the second's names.
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        const DriveShared& sh = g_shared[i];
+        const CylinderLoader& loader = *g_drv[i].loader;
+        const char* n = i ? "2" : "";
+        Serial.printf(" cyl%s=%u selected%s=%d disk%s=%d outer_knocks%s=%lu inner_knocks%s=%lu", n,
+                      (unsigned)sh.cylinder.load(), n, (int)sh.selected.load(), n, (int)sh.disk_in.load(), n,
+                      (unsigned long)sh.outer_knocks.load(), n, (unsigned long)sh.inner_knocks.load());
+        Serial.printf(" ready%s=%d loads%s=%lu restarts%s=%lu cached%s=%u/%u writable%s=%d", n, loader.ready(), n,
+                      (unsigned long)loader.loads(), n, (unsigned long)loader.restarts(), n,
+                      g_drv[i].cache->cachedTracks(), g_drv[i].cache->tracks(), n, (int)sh.writable.load());
+    }
+    Serial.printf(" host=%s", g_host_off.load() ? "off" : "on");
+    Serial.printf(" side=%u read_us_max=%lu encode_us_max=%lu", (unsigned)g_side.load(), (unsigned long)g_read_us_max,
+                  (unsigned long)g_encode_us_max);
+    Serial.printf(" read_us_mean=%lu encode_us_mean=%lu reads=%lu encodes=%lu",
+                  (unsigned long)(g_reads ? g_read_us_sum / g_reads : 0),
+                  (unsigned long)(g_encodes ? g_encode_us_sum / g_encodes : 0), (unsigned long)g_reads,
+                  (unsigned long)g_encodes);
+    Serial.printf(" card_read_us_max=%lu fill_ms=%lu", (unsigned long)g_card_read_us_max, (unsigned long)g_fill_ms);
+    Serial.printf(" written=%lu write_bad_crc=%lu write_unplaced=%lu bursts_dropped=%lu "
+                  "capture_overruns=%lu write_faults=%lu write_us_max=%lu",
+                  (unsigned long)g_sectors_written, (unsigned long)g_write_bad_crc,
+                  (unsigned long)g_write_unplaced, (unsigned long)g_bursts_dropped.load(),
+                  (unsigned long)g_capture->overruns(), (unsigned long)g_write_faults, (unsigned long)g_write_us_max);
+    Serial.printf(" finish_us_mean=%lu", (unsigned long)(g_finishes ? g_finish_us_sum / g_finishes : 0));
+    // SynthMinder's mailbox, per drive: requests answered, repeats, stray writes (mailbox.h).
+    for (unsigned i = 0; i < g_drive_count; ++i) {
+        const mailbox::MailboxSource& mb = *g_drv[i].mailbox;
+        Serial.printf(" mailbox%u=%s:%lu/%lu/%lu", i, mb.active() ? "on" : "off", (unsigned long)mb.exchanges(),
+                      (unsigned long)mb.repeats(), (unsigned long)mb.rejected());
+    }
+    Serial.printf(" decode_kbps=%lu decode_bytes=%llu finish_us_max=%lu burst_gap_us_max=%lu",
+                  (unsigned long)(g_decode_us_sum ? g_decode_bytes * 1000 / g_decode_us_sum : 0),
+                  (unsigned long long)g_decode_bytes, (unsigned long)g_finish_us_max,
+                  (unsigned long)g_burst_gap_us_max);
+    Serial.printf(" pack=%s audio_underruns=%lu audio_gap_us_max=%lu voices_stolen=%lu", g_pack_ok ? packName() : "none",
+                  (unsigned long)audio::underruns(), (unsigned long)audio::gapUsMax(), (unsigned long)g_mixer.voicesStolen());
+    Serial.printf(" clicks=%lu seeks=%lu bumps=%lu act_dropped=%lu", (unsigned long)g_activity.clicks(),
+                  (unsigned long)g_activity.seeks(), (unsigned long)g_activity.bumps(),
+                  (unsigned long)(g_activity.dropped() + g_drive_events_dropped.load()));
+    Serial.printf(" oled=%d frames=%lu draw_us_max=%lu oled_aborts=%lu volume=%d", (int)panel::displayFound(),
+                  (unsigned long)panel::frames(), (unsigned long)panel::drawUsMax(), (unsigned long)panel::aborts(),
+                  panel::model().volume());
+#endif
+    Serial.print("\n");
+}
+
+// ---- Solder-bridge test (console `x`, then `Y`) -----------------------------
+//
+// Pulls each interface pin low in turn, with the others pulled up, to find
+// solder bridges (short_test.h). Only with the floppy cable unplugged: it
+// drives the pins. Core 1 is paused while it runs, and the board reboots
+// afterwards so the normal pin setup comes back.
+
+constexpr uint32_t SHORT_TEST_CONFIRM_MS = 10000;
+static bool g_short_test_armed = false;
+static uint32_t g_short_test_armed_ms = 0;  // when `x` armed it
+
+static void emitLine(const char* line, void*) { Serial.println(line); }
+
+static void runShortTest() {
+    Serial.println("# short test: running, core 1 paused");
+    Serial.flush();
+    rp2040.idleOtherCore();
+
+    uint32_t observed = short_test::observedMask();
+    uint32_t driven = short_test::drivenMask();
+    for (unsigned g = 0; g < 32; ++g) {
+        if ((observed >> g) & 1) {
+            gpio_init(g);                    // SIO input
+            gpio_set_pulls(g, true, false);  // pull-up only: never pull-downs (E9)
+        }
+    }
+    busy_wait_us(500);
+    uint32_t baseline_low = ~gpio_get_all() & observed;
+
+    uint32_t low_when_driven[32] = {};
+    for (unsigned g = 0; g < 32; ++g) {
+        if (!((driven >> g) & 1) || ((baseline_low >> g) & 1)) continue;  // stuck pins: never driven
+        gpio_put(g, 0);
+        gpio_set_dir(g, GPIO_OUT);  // 50 us at the default 4 mA drive
+        busy_wait_us(50);
+        low_when_driven[g] = ~gpio_get_all() & observed;
+        gpio_set_dir(g, GPIO_IN);
+        busy_wait_us(100);  // pull-ups bring the line back
+    }
+
+    short_test::report(short_test::analyse(baseline_low, low_when_driven), emitLine, nullptr);
+    Serial.println("# rebooting to restore the pin setup");
+    Serial.flush();
+    delay(100);
+    rp2040.reboot();
+}
+
+#if FIRMWARE_SLICE != 0
+// Console `e`: one setting into /FDDSYNTH.CFG, without taking the card out.
+// Type e, then the setting (`interface=shugart`), then Enter. Written at
+// once if the drive is idle, so the card is never written under the host;
+// `!` then restarts with it. Prints the file as it now is.
+static constexpr uint32_t SETTING_LINE_MS = 30000;
+static char g_setting_line[settings::NAME + 32];
+static size_t g_setting_len = 0;
+static bool g_taking_setting = false;
+static uint32_t g_setting_ms = 0;  // when `e` was typed
+// The same line, after `j`: an image's name to swap to.
+static bool g_line_is_jump = false;
+
+// Console `j`: straight to the image typed (its name, with or without the
+// extension), one swap instead of a `]` for each image on the way.
+static void applyJumpLine() {
+    const ImageList& images = sd_image::images();
+    size_t i = images.match(g_setting_line, g_setting_len);
+    if (i == images.count()) {
+        Serial.printf("# no image called %.*s (l lists them)\n", int(g_setting_len), g_setting_line);
+        return;
+    }
+    const DriveState& s = g_drv[g_console_drive];
+    if (s.from_card && s.builtin == Builtin::None && s.image_index == i) {
+        Serial.printf("# %s is in already\n", images.name(i));
+        return;
+    }
+    startSwap(g_console_drive, i);
+}
+
+// Console `l`: the images on the card, the one in marked.
+static void listImages() {
+    const ImageList& images = sd_image::images();
+    const DriveState& s = g_drv[g_console_drive];
+    for (size_t i = 0; i < images.count(); ++i)
+        Serial.printf("# %c %2u %s\n", s.from_card && s.builtin == Builtin::None && s.image_index == i ? '*' : ' ',
+                      unsigned(i + 1), images.name(i));
+    if (!images.count()) Serial.println("# no images on the card");
+}
+
+static void applySettingLine() {
+    if (!g_card) {
+        Serial.println("# no card: nothing to save the setting to");
+        return;
+    }
+    if (!driveIdle()) {
+        Serial.println("# the drive is in use: try again when the host has let it go");
+        return;
+    }
+    settings::Settings next = g_latest;
+    if (!settings::set(next, g_setting_line, g_setting_len)) {
+        Serial.printf("# not a setting, or a value it can't take: %.*s\n", int(g_setting_len), g_setting_line);
+        return;
+    }
+    static char text[settings::FILE_MAX];  // off core 0's stack
+    size_t n = settings::format(next, text, sizeof text);
+    if (!sd_image::writeSettings(text, n)) {
+        Serial.println("# couldn't save the settings to the card");
+        return;
+    }
+    g_settings = g_latest = next;
+    // The volume and the pack also take effect now: serviceSettings() saves
+    // what's in use (the panel's volume, the loaded pack), so leaving them
+    // to the restart put the old values back in the file if a second
+    // setting came first. The drive is idle, so a pack can load now.
+    panel::model().setVolume(next.volume);
+    if (sd_image::packs().count()) {
+        size_t pack = sd_image::packs().find(next.pack);
+        if (pack < sd_image::packs().count() && pack != g_pack_index) loadPack(pack);
+    }
+    for (size_t at = 0; at < n;) {
+        size_t end = at;
+        while (end < n && text[end] != '\n') ++end;
+        Serial.printf("CONFIG %.*s\n", int(end - at), text + at);
+        at = end + 1;
+    }
+    Serial.println("# saved: ! restarts the drive with it");
+}
+
+// While a setting is being typed: true if `c` was taken for it.
+static bool takeSettingChar(int c) {
+    if (!g_taking_setting) return false;
+    if (millis() - g_setting_ms > SETTING_LINE_MS) {
+        g_taking_setting = false;
+        Serial.println("# setting not entered in time");
+        return false;
+    }
+    if (c == '\r' || c == '\n') {
+        if (!g_setting_len) return true;  // the Enter after `e` itself
+        g_taking_setting = false;
+        if (g_line_is_jump)
+            applyJumpLine();
+        else
+            applySettingLine();
+        return true;
+    }
+    if (g_setting_len < sizeof g_setting_line) g_setting_line[g_setting_len++] = char(c);
+    return true;
+}
+#endif
+
+static void handleConsole() {
+    while (Serial.available()) {
+        int c = Serial.read();
+#if FIRMWARE_SLICE != 0
+        if (takeSettingChar(c)) continue;
+#endif
+        if (c != 'x' && c != 'Y' && c != '\r' && c != '\n') g_short_test_armed = false;
+        switch (c) {
+            case 'h':
+                printReady();
+#if FIRMWARE_SLICE == 0
+                Serial.println("# h help, p pins, s stats, m mark, x short test (cable unplugged), "
+                               "b reboot to bootloader");
+#else
+                Serial.println("# h help, p pins, s stats, i image, [ ] previous/next image, j jump to an image, l list images, d disk in/out, "
+                               "g generated disk on/off, 1 2 which drive i [ ] d g t act on, k next sample pack, "
+                               "t time a loader step, z zero timings, , . < > the panel's button, press and turns, e set a setting, ! restart, m mark, "
+                               "x short test (cable unplugged), b reboot to bootloader");
+#endif
+                break;
+            case 'p': printPins(); break;
+            case 's': printStats(); break;
+            case 'm':  // a timestamp, so tests can line phases up with the trace
+                Serial.printf("MARK %lu\n", (unsigned long)time_us_32());
+                break;
+            case 'x':
+                Serial.println("# SHORT TEST drives the interface pins. UNPLUG THE FLOPPY CABLE from the BB48 first,");
+                Serial.println("# then type Y (capital) within 10 s to run it. Anything else cancels.");
+                g_short_test_armed_ms = millis();
+                g_short_test_armed = true;
+                break;
+            case 'Y':
+                if (g_short_test_armed && millis() - g_short_test_armed_ms < SHORT_TEST_CONFIRM_MS) {
+                    runShortTest();  // reboots
+                }
+                Serial.println("# short test not armed: type x first");
+                break;
+#if FIRMWARE_SLICE != 0
+            case 'i': printImage(g_console_drive); break;
+            case '1':
+            case '2':
+                if (unsigned(c - '1') < g_drive_count) g_console_drive = unsigned(c - '1');
+                Serial.printf("# console drive %s\n", driveName(g_console_drive));
+                break;
+            case 'k':  // the next pack, as the panel's pack list does: when the drive is idle
+                if (sd_image::packs().count()) g_pack_request = int(sd_image::packs().next(g_pack_index));
+                break;
+            case '[': requestSwap(false); break;
+            case ']': requestSwap(true); break;
+            case 'd': toggleDisk(g_console_drive); break;
+            case 'g': toggleGenerated(); break;
+            case 't': benchLoader(g_console_drive); break;
+            case 'z': zeroTimings(); break;
+            // The panel's controls: the action button, an encoder press, a turn.
+            case ',': panel::inject(ui::Input::Action); break;
+            case '.': panel::inject(ui::Input::Press); break;
+            case '<': panel::inject(ui::Input::TurnDown); break;
+            case '>': panel::inject(ui::Input::TurnUp); break;
+            case 'e':
+            case 'j':
+                g_setting_len = 0;
+                g_setting_ms = millis();
+                g_taking_setting = true;
+                g_line_is_jump = c == 'j';
+                Serial.println(c == 'j' ? "# type an image's name (robocod, or ROBOCOD.ADF), then Enter"
+                                        : "# type a setting (interface=shugart), then Enter");
+                break;
+            case 'l': listImages(); break;
+            case '!':
+                Serial.println("# restarting");
+                Serial.flush();
+                delay(50);
+                rp2040.reboot();
+                break;
+#endif
+            case 'b':
+                Serial.println("# rebooting to bootloader");
+                Serial.flush();
+                delay(50);
+                rp2040.rebootToBootloader();
+                break;
+            default: break;
+        }
+    }
+}
+
+// Core 1 gets its own 8 KB stack from the heap (Arduino-Pico allocates it
+// before setup()). By default it runs on 2 KB just below core 0's 4 KB, and
+// core 0's start-up (mounting the card, parsing IMG.CFG) went 208 bytes past
+// its 4 KB, overwriting where setup1() would return to: core 1 never reached
+// loop1(), and the drive was dead (0.22.1). Now core 0 has both scratch
+// banks, 8 KB, to itself.
+bool core1_separate_stack = true;
+
+// How much of that core 0 uses, for `s` (core0_stack): the space below its
+// frame is painted at power-on, and the first byte changed marks the deepest
+// it has been.
+extern "C" uint8_t __StackOneBottom[], __StackTop[];
+static void paintStack() {
+    uint8_t* here = static_cast<uint8_t*>(__builtin_frame_address(0)) - 256;
+    for (uint8_t* p = __StackOneBottom; p < here; ++p) *p = 0xA5;
+}
+static uint32_t core0StackUsed() {
+    uint8_t* p = __StackOneBottom;
+    while (p < __StackTop && *p == 0xA5) ++p;
+    return uint32_t(__StackTop - p);
+}
+
+void setup() {
+    paintStack();
+    Serial.begin(115200);
+#if FIRMWARE_SLICE != 0
+    panel::begin();  // first: looking for the display can block briefly, before anything runs
+    chooseDisks();
+    if (g_card) panel::model().setVolume(g_settings.volume);
+#endif
+    printReady();
+}
+
+#if FIRMWARE_SLICE != 0
+// Says when the computer is switched off or on (every line low: fdd::hostOff).
+static void serviceHost() {
+    static bool shown = false;
+    bool off = g_host_off.load(std::memory_order_relaxed);
+    if (off == shown) return;
+    shown = off;
+    Serial.println(off ? "# host off: every line is low (the computer is switched off), so they're ignored"
+                       : "# host on");
+}
+#endif
+
+void loop() {
+#if FIRMWARE_SLICE != 0
+    // Audio between every slow step, so the I2S queue never runs dry.
+    audio::service();
+    serviceWrites();  // before loading: a write may be to the cylinder being left
+    audio::service();
+    for (unsigned i = 0; i < g_drive_count; ++i) serviceSwap(i);
+    serviceLoaders();
+    serviceWeakBits();
+    audio::service();
+    serviceActivity();
+    serviceHost();
+    servicePanel();
+    audio::service();
+    servicePack();      // only when the drive is idle
+    serviceSettings();  // likewise
+    serviceMailbox();
+#endif
+    handleConsole();
+
+    // Print what core 1 recorded; a bounded batch so the console stays
+    // responsive. A run that can't be printed yet is kept and retried.
+    static TraceRun pending;
+    static bool has_pending = false;
+    if (has_pending) {
+        char line[160];
+        size_t n = formatRun(pending, line, sizeof line);
+        if (!printLine(line, n)) return;
+        has_pending = false;
+    }
+    // During a write, only a few lines a pass: the capture must be decoded
+    // at the rate it arrives (32 KB is 88 ms of HD), and printing a flood of
+    // trace lines (noise on undriven lines while WDATA toggles, seen on the
+    // Feather rig) took long enough to overrun it. A trace line can wait or
+    // be dropped; a write can't.
+    int batch = 64;
+#if FIRMWARE_SLICE != 0
+    if (g_capture->inBurst()) batch = 4;
+#endif
+    TraceEvent e;
+    for (int i = 0; i < batch && g_trace.pop(e); ++i) {
+        g_last_event_ms = millis();
+        if (g_coalescer.add(e, pending)) {
+            char line[160];
+            size_t n = formatRun(pending, line, sizeof line);
+            if (!printLine(line, n)) {
+                has_pending = true;
+                return;
+            }
+        }
+    }
+    if (millis() - g_last_event_ms >= cfg::TRACE_FLUSH_MS && g_coalescer.flush(pending)) {
+        char line[160];
+        size_t n = formatRun(pending, line, sizeof line);
+        if (!printLine(line, n)) has_pending = true;
+    }
+
+    uint32_t drops = g_dropped.load(std::memory_order_relaxed);
+    if (drops != g_reported_drops) {
+        Serial.printf("DROP %lu\n", (unsigned long)(drops - g_reported_drops));
+        g_reported_drops = drops;
+    }
+}

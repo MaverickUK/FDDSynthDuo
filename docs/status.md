@@ -13,7 +13,7 @@ The drive build (`pio run -e bb48_drive`) is the FDD Synth Duo, on an Olimex RP2
 - it swaps between the images on the card, GoTek style, whatever their formats;
 - it answers as drive A or B, past a twist or on a straight cable, or as Shugart DS0–DS2, or as two drives at once, each with its own disk ([config.md](config.md));
 - on an Amiga it runs the bus at hardware speed in PIO, since an A1200 selects its drive for only a few microseconds at a time;
-- it reports what it does as sound events (motor, clicks, seeks, bumps against the end stops, disk changes), and plays them with a sample pack through an I2S amp ([activity.md](activity.md)); `samples/Recorded/` is a pack cut from a recording of a real drive ([recording.md](recording.md)), `samples/Placeholder/` a synthesised stand-in;
+- it reports what it does as sound events (motor, clicks, seeks, bumps against the end stops, disk changes), and plays them with a sample pack through an I2S amp ([activity.md](activity.md)); `firmware/samples/Recorded/` is a pack cut from a recording of a real drive ([recording.md](recording.md)), `firmware/samples/Placeholder/` a synthesised stand-in;
 - [SynthMinder](https://github.com/MaverickUK/SynthMinder) can find it from DOS and change its disk, pack, volume and settings, through a mailbox at cylinder 82 ([synthminder.md](synthminder.md); in development).
 
 The listen build (`pio run`) records every drive select, motor, side, density and write-gate change and every head step it sees, without driving any pin, and streams the trace over USB serial.
@@ -33,4 +33,4 @@ Its logic is also tested against virtual hosts (a PC's BIOS and controller, an A
 - **Rev C**, the integrated board: the RP2350B, PSRAM, microSD, the amp, power from the floppy connector or USB-C, and the disk-change line wired for the Amiga ([pcb-revc.md](pcb-revc.md)).
 - **SynthMinder with the drive empty:** the BIOS won't reach cylinder 82 without a disk in, so SynthMinder will talk to the floppy controller directly.
 
-The plan, in slices: [plan.md](plan.md). Every change: [CHANGELOG.md](../CHANGELOG.md).
+The plan, in slices: [plan.md](plan.md). Every change: [CHANGELOG.md](../firmware/CHANGELOG.md).

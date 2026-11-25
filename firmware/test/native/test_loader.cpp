@@ -1,0 +1,424 @@
+// Tests for slice 3's loading: image geometry, track sources and the
+// cylinder loader, ending with a timing simulation of seeks against the
+// host's settle time.
+#include <cstdint>
+#include <cstdio>
+#include <utility>
+#include <vector>
+
+#include "check.h"
+#include "cylinder_loader.h"
+#include "rdata_stream.h"
+#include "track_source.h"
+
+// ---- Image geometry ----------------------------------------------------------
+
+TEST(test_format_from_image_size) {
+    ibm::Format f;
+    CHECK(ibm::formatForSize(1474560, f));
+    CHECK_EQ(f.track_bytes, ibm::HD_1440.track_bytes);
+    CHECK(f.kinds[0].usedBytes() == ibm::HD_1440.kinds[0].usedBytes());
+    CHECK(ibm::formatForSize(737280, f));
+    CHECK_EQ(f.rate, 250000u);
+    CHECK(!ibm::formatForSize(1474561, f));
+    CHECK(!ibm::formatForSize(0, f));
+    CHECK(!ibm::formatForSize(2949120, f));  // 2.88 MB: a 1 Mbit/s track, longer than the streamer holds
+    CHECK_EQ(ibm::HD_1440.trackOffset(0, 1), 9216u);
+    CHECK_EQ(ibm::HD_1440.trackOffset(79, 1), 1474560u - 9216u);
+    CHECK_EQ(ibm::DD_720.trackOffset(1, 0), 9216u);
+    CHECK_EQ(ibm::HD_1440.imageBytes(), 1474560u);
+}
+
+// ---- A source to test with ---------------------------------------------------
+
+// The generated disk, with tracks that can be made to fail, and a log of reads.
+class FakeSource : public TrackSource {
+public:
+    explicit FakeSource(const ibm::Format& fmt) : gen_(fmt) {}
+    const ibm::Format& format() const override { return gen_.format(); }
+    bool readTrack(uint8_t cylinder, uint8_t head, uint8_t* out) override {
+        reads.push_back(cylinder * 2 + head);
+        if (cylinder == failing_cylinder && head == failing_head) return false;
+        return gen_.readTrack(cylinder, head, out);
+    }
+
+    std::vector<int> reads;  // cylinder * 2 + head
+    int failing_cylinder = -1;
+    int failing_head = -1;
+
+private:
+    GeneratedSource gen_;
+};
+
+// A loader and the buffers it needs, sized for any format we serve.
+struct Rig {
+    explicit Rig(const ibm::Format& fmt = ibm::HD_1440)
+        : source(fmt),
+          slots(fmt.track_bytes),
+          scratch(fmt.track_bytes),
+          d0(fmt.trackDataBytes()),
+          d1(fmt.trackDataBytes()),
+          loader(source, slots.data(), scratch.data(), d0.data(), d1.data()) {}
+
+    void runUntilIdle() {
+        for (int i = 0; i < 100 && loader.service() != CylinderLoader::Step::Idle; ++i) {}
+    }
+
+    // The buffer as buildCylinder would make it for `cylinder`.
+    bool holds(uint8_t cylinder) {
+        const ibm::Format& fmt = source.format();
+        std::vector<uint8_t> a(fmt.trackDataBytes()), b(fmt.trackDataBytes());
+        gen_disk::track(fmt, cylinder, 0, a.data());
+        gen_disk::track(fmt, cylinder, 1, b.data());
+        std::vector<uint16_t> s(fmt.track_bytes);
+        std::vector<uint32_t> want(fmt.track_bytes);
+        rdata::buildCylinder(fmt, cylinder, a.data(), b.data(), s.data(), want.data());
+        return want == slots;
+    }
+
+    // True if one head's cells are a blank track.
+    bool headIsBlank(uint8_t head) {
+        std::vector<uint16_t> blank(source.format().track_bytes);
+        ibm::buildBlankTrack(source.format(), blank.data());
+        for (size_t i = 0; i < slots.size(); ++i)
+            if (rdata::headCells(slots[i], head) != blank[i]) return false;
+        return true;
+    }
+
+    FakeSource source;
+    std::vector<uint32_t> slots;
+    std::vector<uint16_t> scratch;
+    std::vector<uint8_t> d0, d1;
+    CylinderLoader loader;
+};
+
+using Step = CylinderLoader::Step;
+
+namespace {  // this file's own helpers and tests
+
+// ---- The loader ----------------------------------------------------------------
+
+TEST(test_loader_loads_in_four_steps) {
+    Rig r;
+    CHECK_EQ(r.loader.ready(), -1);
+    CHECK(r.loader.service() == Step::ReadHead0);
+    CHECK(r.loader.service() == Step::ReadHead1);
+    CHECK_EQ(r.loader.ready(), -1);
+    CHECK(r.loader.service() == Step::EncodeHead0);
+    CHECK(r.loader.service() == Step::EncodeHead1);
+    CHECK_EQ(r.loader.ready(), 0);
+    CHECK(r.loader.service() == Step::Idle);
+    CHECK(r.holds(0));
+    CHECK_EQ(r.loader.loads(), 1u);
+    CHECK_EQ(r.source.reads.size(), 2u);
+}
+
+TEST(test_loader_follows_the_head) {
+    Rig r;
+    r.runUntilIdle();
+    r.loader.request(41);
+    r.runUntilIdle();
+    CHECK_EQ(r.loader.ready(), 41);
+    CHECK(r.holds(41));
+    CHECK(r.loader.service() == Step::Idle);
+}
+
+TEST(test_loader_restarts_when_the_head_moves) {
+    Rig r;
+    r.runUntilIdle();
+    r.loader.request(5);
+    r.loader.service();  // read head 0 of 5
+    r.loader.service();  // read head 1 of 5
+    r.loader.request(6);
+    CHECK(r.loader.service() == Step::ReadHead0);  // straight on to 6
+    r.runUntilIdle();
+    CHECK_EQ(r.loader.ready(), 6);
+    CHECK(r.holds(6));
+    CHECK_EQ(r.loader.restarts(), 1u);
+    CHECK_EQ(r.loader.loads(), 2u);  // 0 and 6: 5 was never finished
+}
+
+TEST(test_loader_clears_ready_from_the_first_write) {
+    Rig r;
+    r.loader.request(3);
+    r.runUntilIdle();
+    r.loader.request(4);
+    r.loader.service();
+    r.loader.service();
+    CHECK_EQ(r.loader.ready(), 3);  // reading only: the buffer still holds 3
+    r.loader.service();
+    CHECK_EQ(r.loader.ready(), -1);  // half of 4 is in the buffer now
+    r.loader.request(3);             // even going back to 3 needs a full load
+    r.runUntilIdle();
+    CHECK_EQ(r.loader.ready(), 3);
+    CHECK(r.holds(3));
+}
+
+TEST(test_loader_head_moving_back_during_reads) {
+    Rig r;
+    r.loader.request(10);
+    r.runUntilIdle();
+    r.loader.request(11);
+    r.loader.service();  // read 11 head 0: the buffer is untouched
+    r.loader.request(10);
+    CHECK(r.loader.service() == Step::Idle);  // still holds 10
+    CHECK_EQ(r.loader.ready(), 10);
+}
+
+TEST(test_loader_blank_beyond_the_image) {
+    Rig r;
+    r.loader.request(82);
+    r.runUntilIdle();
+    CHECK_EQ(r.loader.ready(), 82);
+    CHECK(r.headIsBlank(0));
+    CHECK(r.headIsBlank(1));
+}
+
+TEST(test_loader_read_error_blanks_one_head) {
+    Rig r;
+    r.source.failing_cylinder = 7;
+    r.source.failing_head = 1;
+    r.loader.request(7);
+    r.runUntilIdle();
+    CHECK_EQ(r.loader.ready(), 7);
+    CHECK(r.headIsBlank(1));
+    CHECK(!r.headIsBlank(0));
+}
+
+// ---- Showing a write while the buffer streams ---------------------------------
+
+// The streamer's position, as the test sets it.
+struct FixedPosition : StreamPosition {
+    uint32_t word = NOT_STREAMING;
+    uint32_t nextWord(const uint32_t*) const override { return word; }
+};
+
+std::vector<uint16_t> cellsOf(const std::vector<uint32_t>& slots, uint8_t head) {
+    std::vector<uint16_t> out(slots.size());
+    for (size_t i = 0; i < slots.size(); ++i) out[i] = rdata::headCells(slots[i], head);
+    return out;
+}
+
+// [first, end) runs where two tracks' cells differ, gaps of up to 4 words
+// inside a run (a data field's CRC can match by chance; its mark never changes).
+std::vector<std::pair<uint32_t, uint32_t>> changedRuns(const std::vector<uint16_t>& a, const std::vector<uint16_t>& b) {
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+    for (uint32_t i = 0; i < a.size(); ++i) {
+        if (a[i] == b[i]) continue;
+        if (!runs.empty() && i - runs.back().second <= 4)
+            runs.back().second = i + 1;
+        else
+            runs.push_back({i, i + 1});
+    }
+    return runs;
+}
+
+// Cylinder 5 loaded, with a stream position; then every sector of head 0
+// rewritten with 0xF6 (as a format does), and the head encoded. `old` and
+// `fresh` are head 0's cells before and as they should end up.
+struct WriteRig {
+    explicit WriteRig(uint32_t at_offset_in_sector4, bool inside) {
+        r.loader.setStreamPosition(&pos);
+        r.loader.request(5);
+        r.runUntilIdle();
+        old = cellsOf(r.slots, 0);
+        other = cellsOf(r.slots, 1);
+        const ibm::Format& fmt = r.source.format();
+        std::vector<uint8_t> data(fmt.track(5, 0).dataBytes(), 0xF6);
+        fresh.resize(fmt.track_bytes);
+        ibm::buildTrack(fmt, 5, 0, data.data(), fresh.data());
+        runs = changedRuns(old, fresh);
+        pos.word = inside ? runs[3].first + at_offset_in_sector4 : runs[3].second + at_offset_in_sector4;
+        for (uint8_t sec = 0; sec < fmt.track(5, 0).sectors; ++sec)
+            r.loader.storeSector(5, 0, sec, data.data() + sec * fmt.sectorBytes());
+        r.loader.encodeHead(5, 0);
+    }
+    // Head 0's cells are the new track's except in `held` (the old), and head 1's are untouched.
+    bool shows(int held) const {
+        std::vector<uint16_t> now = cellsOf(r.slots, 0);
+        for (uint32_t i = 0; i < now.size(); ++i) {
+            bool in = held >= 0 && i >= runs[size_t(held)].first && i < runs[size_t(held)].second;
+            if (now[i] != (in ? old[i] : fresh[i])) return false;
+        }
+        return cellsOf(r.slots, 1) == other;
+    }
+    Rig r;
+    FixedPosition pos;
+    std::vector<uint16_t> old, fresh, other;
+    std::vector<std::pair<uint32_t, uint32_t>> runs;
+};
+
+TEST(test_loader_holds_the_sector_under_the_head) {
+    // The host is reading sector 4 when the write is shown: it must read it
+    // whole, old, and every other sector new. On the Evesham, FORMAT's
+    // verify read a sector half old, half new, and failed.
+    WriteRig w(100, true);
+    CHECK_EQ(w.runs.size(), 18u);  // a data field a sector
+    CHECK(w.r.loader.holding());
+    CHECK_EQ(w.r.loader.heldRuns(), 1u);
+    CHECK(w.shows(3));
+    CHECK(w.r.loader.service() == Step::Idle);  // still in it
+    CHECK(w.shows(3));
+    w.pos.word = w.runs[3].second;  // just past it, but RDATA, behind, isn't
+    CHECK(w.r.loader.service() == Step::Idle);
+    w.pos.word = w.runs[3].second + StreamPosition::LAG_WORDS;
+    CHECK(w.r.loader.service() == Step::Held);
+    CHECK(!w.r.loader.holding());
+    CHECK(w.shows(-1));
+}
+
+TEST(test_loader_held_run_waits_for_a_head_coming_round) {
+    // A head about to reach the run (it will be inside before the rebuild
+    // is done) waits too, then a head well clear of it doesn't.
+    WriteRig w(100, true);
+    w.pos.word = w.runs[3].first - 10;
+    CHECK(w.r.loader.service() == Step::Idle);
+    CHECK(w.shows(3));
+    w.pos.word = w.runs[8].first;
+    CHECK(w.r.loader.service() == Step::Held);
+    CHECK(w.shows(-1));
+}
+
+TEST(test_loader_copies_at_once_with_the_head_in_a_gap) {
+    WriteRig w(40, false);  // in the gap after sector 4
+    CHECK(!w.r.loader.holding());
+    CHECK_EQ(w.r.loader.heldRuns(), 0u);
+    CHECK(w.shows(-1));
+}
+
+TEST(test_loader_copies_at_once_when_not_streaming) {
+    WriteRig w(100, true);
+    w.r.loader.reset();  // a new disk: nothing held
+    CHECK(!w.r.loader.holding());
+    Rig r;  // no stream position at all
+    r.loader.request(5);
+    r.runUntilIdle();
+    std::vector<uint8_t> data(512, 0xF6);
+    CHECK(r.loader.writeSector(5, 0, 3, data.data()));
+    CHECK(!r.loader.holding());
+}
+
+TEST(test_loader_load_drops_a_held_run) {
+    // The head moves on before the run is copied: the load rewrites it all.
+    WriteRig w(100, true);
+    w.pos.word = StreamPosition::NOT_STREAMING;
+    w.r.loader.request(6);
+    w.r.runUntilIdle();
+    CHECK(!w.r.loader.holding());
+    CHECK(w.r.holds(6));
+}
+
+TEST(test_loader_dd_format) {
+    Rig r(ibm::DD_720);
+    r.loader.request(79);
+    r.runUntilIdle();
+    CHECK(r.holds(79));
+}
+
+// ---- Timing: is the cylinder ready when the host reads? -------------------------
+//
+// An event simulation: the host steps at fixed intervals while the loader
+// works through its steps, each taking a fixed time. The loader only sees a
+// new cylinder between steps, as on core 0. The answer is how long after the
+// host's last step the buffer holds its cylinder; the host waits 15 ms (its
+// settle time) before reading.
+
+struct Costs {
+    uint32_t read_us;    // one track from the SD card
+    uint32_t encode_us;  // one track encoded into the buffer
+};
+
+static uint32_t readyAfterLastStep(int from, int to, uint32_t step_interval_us, uint32_t first_step_us,
+                                   Costs c) {
+    Rig r;
+    r.loader.request(uint8_t(from));
+    r.runUntilIdle();
+    int dir = to > from ? 1 : -1;
+    int steps = (to - from) * dir;
+    uint32_t last_step = first_step_us + uint32_t(steps - 1) * step_interval_us;
+    uint32_t t = 0;
+    int taken = 0;
+    for (int guard = 0; guard < 100000; ++guard) {
+        while (taken < steps && first_step_us + uint32_t(taken) * step_interval_us <= t) {
+            ++taken;
+            r.loader.request(uint8_t(from + dir * taken));
+        }
+        if (taken == steps && r.loader.ready() == to) return t - last_step;
+        Step s = r.loader.service();
+        if (s == Step::Idle)
+            t = first_step_us + uint32_t(taken) * step_interval_us;  // wait for the next step
+        else
+            t += (s == Step::ReadHead0 || s == Step::ReadHead1) ? c.read_us : c.encode_us;
+    }
+    return UINT32_MAX;
+}
+
+// The worst case over the phase of the steps against the loader's work.
+static uint32_t worstReady(int from, int to, uint32_t interval_us, Costs c) {
+    uint32_t worst = 0;
+    // About 12 phases per interval: enough to land a step at every point of a
+    // load, which is 7 ms long.
+    uint32_t stride = interval_us / 12 > 250 ? interval_us / 12 : 250;
+    for (uint32_t phase = 0; phase < interval_us; phase += stride) {
+        uint32_t v = readyAfterLastStep(from, to, interval_us, phase, c);
+        if (v > worst) worst = v;
+    }
+    return worst;
+}
+
+TEST(test_ready_within_settle_time) {
+    // Reads from the image cache in the BB48R's PSRAM (image_cache.h): a
+    // 9 KB copy over QSPI, allowed 1 ms until the board measures it
+    // (read_us_max). Encoding a track: 3.1 ms, as measured on the board
+    // (console `t`, 2026-11-04: built in 1.56 ms, interleaved in 1.48 ms).
+    const Costs cached{1000, 3100};
+    const uint32_t SETTLE_US = 15000;
+    // The longest a load could take after the last step: the step in
+    // progress when the head arrives, then a whole load.
+    const uint32_t bound = 3100 + 2 * 1000 + 2 * 3100;
+    struct { int from, to; uint32_t interval; } seeks[] = {
+        {0, 1, 3000},     // one step, PC step rate
+        {0, 79, 3000},    // a full seek at the PC's fastest rate
+        {79, 0, 10000},   // Greaseweazle
+        {0, 79, 26000},   // the Feather host's 13 + 13 ms steps
+        {40, 41, 26000},
+    };
+    for (auto& s : seeks) {
+        uint32_t worst = worstReady(s.from, s.to, s.interval, cached);
+        std::printf("    seek %d->%d every %u us: ready %.1f ms after the last step\n", s.from, s.to, s.interval,
+                    worst / 1000.0);
+        CHECK(worst <= bound);
+        CHECK(worst < SETTLE_US);
+    }
+}
+
+TEST(test_slow_card_misses_the_settle_time) {
+    // Straight from the card, without the cache: SPI at about 1 MB/s (a slow
+    // clock, or no DMA) is 9 ms a track. Even 25 MHz (3.5 ms) left no room
+    // for a panel frame; the cache is why the card can run at 25 MHz. Too slow
+    // for 15 ms; the host then finds no sectors on its first revolution and
+    // retries on the next.
+    const Costs slow{9000, 3100};
+    CHECK(worstReady(0, 1, 3000, slow) > 15000);
+}
+
+}  // namespace
+
+void runLoaderTests() {
+    RUN(test_format_from_image_size);
+    RUN(test_loader_loads_in_four_steps);
+    RUN(test_loader_follows_the_head);
+    RUN(test_loader_restarts_when_the_head_moves);
+    RUN(test_loader_clears_ready_from_the_first_write);
+    RUN(test_loader_head_moving_back_during_reads);
+    RUN(test_loader_blank_beyond_the_image);
+    RUN(test_loader_read_error_blanks_one_head);
+    RUN(test_loader_holds_the_sector_under_the_head);
+    RUN(test_loader_held_run_waits_for_a_head_coming_round);
+    RUN(test_loader_copies_at_once_with_the_head_in_a_gap);
+    RUN(test_loader_copies_at_once_when_not_streaming);
+    RUN(test_loader_load_drops_a_held_run);
+    RUN(test_loader_dd_format);
+    RUN(test_ready_within_settle_time);
+    RUN(test_slow_card_misses_the_settle_time);
+}
